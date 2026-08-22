@@ -680,6 +680,9 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
 
+    // the output projection is replicated on all devices instead of being split (llama_model_params::output_mirrored)
+    bool output_mirrored = false;
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 

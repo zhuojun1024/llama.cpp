@@ -17,6 +17,20 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
+// where the output projection of a DFlash2 draft lives:
+//   DRAFT  - reduced-vocab draft, ships its own output projection
+//   TARGET - full-vocab draft, shares the target model's output projection
+enum common_speculative_draft_output {
+    COMMON_SPECULATIVE_DRAFT_OUTPUT_NONE = 0, // not a DFlash2 draft
+    COMMON_SPECULATIVE_DRAFT_OUTPUT_DRAFT,
+    COMMON_SPECULATIVE_DRAFT_OUTPUT_TARGET,
+};
+
+// inspect the draft GGUF and determine where its output projection lives (see above);
+// a DFlash2 draft's selector computes a global top-k over the full vocabulary, which requires
+// that projection to be replicated on all devices (llama_model_params::output_mirrored)
+enum common_speculative_draft_output common_speculative_draft_output_ownership(const std::string & path);
+
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 
