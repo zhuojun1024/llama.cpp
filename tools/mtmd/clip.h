@@ -58,6 +58,9 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    // how to distribute the model tensors across GPUs, size: llama_max_devices()
+    // NULL = disabled (single-GPU behavior); only used when use_gpu is true
+    const float * tensor_split;
 };
 
 struct clip_init_result {

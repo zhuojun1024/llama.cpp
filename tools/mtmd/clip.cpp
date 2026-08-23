@@ -157,7 +157,13 @@ struct clip_ctx {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
-    ggml_backend_buffer_ptr buf;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+
+    // tensor split across multiple GPUs (see clip_context_params.tensor_split)
+    std::vector<ggml_backend_t> backends_gpu;
+    std::vector<ggml_backend_dev_t> split_devs;
+    std::vector<float> split_points; // normalized cumulative split points
+    bool tensor_split_active = false;
 
 
     int max_nodes = 8192;
@@ -192,16 +198,28 @@ struct clip_ctx {
                     throw std::runtime_error(string_format("%s: failed to initialize \"%s\" backend\n",
                                                            __func__, ggml_backend_dev_name(ctx_params.device)));
                 }
-            } else {
+            }
+            if (!backend && ctx_params.tensor_split != nullptr) {
+                try_init_tensor_split(ctx_params.tensor_split);
+            }
+            if (!backend) {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
                 backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
             }
         }
 
         if (backend) {
-            LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
-            backend_ptrs.push_back(backend);
-            backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
+            if (tensor_split_active) {
+                for (ggml_backend_t b : backends_gpu) {
+                    LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(b));
+                    backend_ptrs.push_back(b);
+                    backend_buft.push_back(ggml_backend_get_default_buffer_type(b));
+                }
+            } else {
+                LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
+                backend_ptrs.push_back(backend);
+                backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
+            }
         } else {
             backend = backend_cpu;
             LOG_INF("%s: CLIP using CPU backend\n", __func__);
@@ -228,8 +246,86 @@ struct clip_ctx {
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
+    // distribute the model tensors across all non-CPU devices
+    // (same device selection as the main model's LLAMA_SPLIT_MODE_TENSOR);
+    // returns false (leaving backend unset) if fewer than 2 devices are available
+    bool try_init_tensor_split(const float * tensor_split) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
+                continue;
+            }
+            split_devs.push_back(dev);
+        }
+        if (split_devs.size() <= 1) {
+            return false;
+        }
+        tensor_split_active = true;
+        for (ggml_backend_dev_t dev : split_devs) {
+            ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+            if (!b) {
+                throw std::runtime_error(string_format("failed to initialize backend for device %s", ggml_backend_dev_name(dev)));
+            }
+            backends_gpu.push_back(b);
+        }
+        backend = backends_gpu.front();
+
+        // compute the normalized cumulative split points
+        const size_t n = split_devs.size();
+        std::vector<float> splits(n, 0.0f);
+        bool all_zero = true;
+        for (size_t i = 0; i < n; ++i) {
+            splits[i] = tensor_split[i];
+            all_zero = all_zero && splits[i] == 0.0f;
+        }
+        if (all_zero) {
+            // default split, by free memory (same as the main model)
+            size_t cpu_free = 0, cpu_total = 0;
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev) {
+                ggml_backend_dev_memory(cpu_dev, &cpu_free, &cpu_total);
+            }
+            for (size_t i = 0; i < n; ++i) {
+                size_t free, total;
+                ggml_backend_dev_memory(split_devs[i], &free, &total);
+                if (free == 0 && total == 0) {
+                    free = cpu_free;
+                }
+                splits[i] = (float) free;
+            }
+        }
+        float acc = 0.0f;
+        split_points.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            acc += splits[i];
+            split_points[i] = acc;
+        }
+        if (acc <= 0.0f) {
+            // degenerate: fall back to an even split
+            for (size_t i = 0; i < n; ++i) {
+                split_points[i] = (float) (i + 1) / (float) n;
+            }
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                split_points[i] /= acc;
+            }
+        }
+
+        LOG_INF("%s: CLIP tensor split across %zu devices:\n", __func__, n);
+        for (size_t i = 0; i < n; ++i) {
+            LOG_INF("%s: - device %zu: %s (%s)\n", __func__, i,
+                    ggml_backend_dev_name(split_devs[i]), ggml_backend_dev_description(split_devs[i]));
+        }
+        return true;
+    }
+
     ~clip_ctx() {
-        ggml_backend_free(backend);
+        for (ggml_backend_t b : backends_gpu) {
+            ggml_backend_free(b);
+        }
+        if (backends_gpu.empty() && backend && backend != backend_cpu) {
+            ggml_backend_free(backend);
+        }
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
         }
@@ -2119,7 +2215,10 @@ struct clip_model_loader {
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
                 // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                // (in tensor split mode the per-device accounting is done at allocation time)
+                if (!ctx_clip.tensor_split_active) {
+                    ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                }
             }
             return cur;
         };
@@ -3557,9 +3656,68 @@ struct clip_model_loader {
             }
 
             // alloc memory and offload data
-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (ctx_clip.tensor_split_active) {
+                // distribute the weight tensors across the split devices,
+                // assigning each tensor whole to the device whose cumulative byte range contains it
+                const size_t n_devs = ctx_clip.split_devs.size();
+
+                // group the tensors by device
+                std::vector<std::vector<ggml_tensor *>> tensors_by_dev(n_devs);
+                size_t bytes_acc = 0;
+                for (auto & t : tensors_to_load) {
+                    ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
+                    GGML_ASSERT(cur && "tensor not found in ctx_data");
+                    const size_t nbytes = ggml_nbytes(cur);
+                    const size_t mid = bytes_acc + nbytes / 2;
+                    size_t i_dev = n_devs - 1;
+                    for (size_t i = 0; i < n_devs; ++i) {
+                        if ((double) ctx_clip.split_points[i] * (double) total_data_size >= (double) mid) {
+                            i_dev = i;
+                            break;
+                        }
+                    }
+                    tensors_by_dev[i_dev].push_back(cur);
+                    // add to per-device weight memory counter
+                    ctx_clip.mem_usage[ctx_clip.split_devs[i_dev]] += nbytes;
+                    LOG_DBG("%s: tensor %s assigned to device %s\n", __func__, t->name,
+                            ggml_backend_dev_name(ctx_clip.split_devs[i_dev]));
+                    bytes_acc += nbytes;
+                }
+
+                // allocate one buffer per device and place the assigned tensors in it
+                for (size_t i = 0; i < n_devs; ++i) {
+                    if (tensors_by_dev[i].empty()) {
+                        continue; // no tensors assigned to this device
+                    }
+                    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ctx_clip.split_devs[i]);
+                    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+                    size_t buf_size = 0;
+                    for (ggml_tensor * t : tensors_by_dev[i]) {
+                        buf_size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+                    }
+                    ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, buf_size));
+                    if (!buf) {
+                        throw std::runtime_error(string_format("%s: failed to allocate %s buffer of size %zu\n",
+                                __func__, ggml_backend_buft_name(buft), buf_size));
+                    }
+                    struct ggml_tallocr tallocr = ggml_tallocr_new(buf.get());
+                    for (ggml_tensor * t : tensors_by_dev[i]) {
+                        const enum ggml_status status = ggml_tallocr_alloc(&tallocr, t);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            throw std::runtime_error(string_format("%s: failed to initialize tensor %s\n", __func__, t->name));
+                        }
+                    }
+                    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    LOG_INF("%s: %10s model buffer size = %8.2f MiB (%zu tensors)\n", __func__,
+                            ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0,
+                            tensors_by_dev[i].size());
+                    ctx_clip.bufs.push_back(std::move(buf));
+                }
+            } else {
+                ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+                ctx_clip.bufs.emplace_back(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+                ggml_backend_buffer_set_usage(ctx_clip.bufs.back().get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
             // read the weight from file
             if (!ctx_clip.no_alloc) {
                 size_t data_loaded = 0;
@@ -3574,7 +3732,7 @@ struct clip_model_loader {
                         throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
                     }
                     size_t num_bytes = ggml_nbytes(cur);
-                    if (ggml_backend_buft_is_host(buft)) {
+                    if (ggml_backend_buffer_is_host(cur->buffer)) {
                         // for the CPU and Metal backend, we can read directly into the tensor
                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
                     } else {
@@ -3752,7 +3910,19 @@ struct clip_model_loader {
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
             ggml_tensor * node = ggml_graph_node(gf, i);
             res.ops.push_back({node, true});
-            if (!ggml_backend_supports_op(ctx_clip.backend, node)) {
+            bool supported = false;
+            if (ctx_clip.tensor_split_active) {
+                // in tensor split mode the op is accelerated if any of the GPU backends supports it
+                for (ggml_backend_t b : ctx_clip.backends_gpu) {
+                    if (ggml_backend_supports_op(b, node)) {
+                        supported = true;
+                        break;
+                    }
+                }
+            } else {
+                supported = ggml_backend_supports_op(ctx_clip.backend, node);
+            }
+            if (!supported) {
                 res.ops.back().is_accel = false;
                 if (node->op == GGML_OP_FLASH_ATTN_EXT) {
                     res.fattn    = false;

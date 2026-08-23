@@ -1055,6 +1055,10 @@ private:
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mparams.media_marker     = get_media_marker();
+            // distribute the mmproj tensors across GPUs when the main model uses tensor split mode
+            if (params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                mparams.tensor_split = params_base.tensor_split;
+            }
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
