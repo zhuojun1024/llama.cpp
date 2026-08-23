@@ -264,6 +264,12 @@ if (CUDAToolkit_FOUND)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+
+    if (WIN32)
+        # prevent windows.h from pulling in winsock.h (v1), which conflicts with winsock2.h
+        #     used by the CUDA/NCCL headers (matters when GGML_USE_NCCL is enabled)
+        target_compile_definitions(ggml-cuda PRIVATE WIN32_LEAN_AND_MEAN)
+    endif()
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()

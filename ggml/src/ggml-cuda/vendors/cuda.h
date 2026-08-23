@@ -7,6 +7,9 @@
 #include <cuda_fp16.h>
 
 #ifdef GGML_USE_NCCL
+#if defined(_WIN32)
+#include <winsock2.h> // must precede nccl.h to avoid winsock.h (v1) conflict
+#endif
 #include <nccl.h>
 #endif // GGML_USE_NCCL
 
