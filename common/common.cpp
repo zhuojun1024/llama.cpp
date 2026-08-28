@@ -1292,6 +1292,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // a full-vocab DFlash2 draft computes a global top-k over the full vocabulary in its selector,
+    // which requires the target's output projection to be replicated on all devices; this must be
+    // set before the model is loaded, as the meta buffers are sized from the tensor split states
+    if (params.speculative.has_dft() &&
+            common_speculative_draft_output_ownership(params.speculative.draft.mparams.path) == COMMON_SPECULATIVE_DRAFT_OUTPUT_TARGET) {
+        mparams.output_mirrored = true;
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
