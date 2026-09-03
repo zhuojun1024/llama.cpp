@@ -952,6 +952,30 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
+bool ggml_cuda_ar_allreduce3(
+        ggml_cuda_ar_pipeline * pipeline_a,
+        ggml_cuda_ar_pipeline * pipeline_b,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    // pipeline_a covers (dev0, dev1), pipeline_b covers (dev0, dev2).
+    // Step 1: reduce dev0 + dev1 on both devices.
+    if (!ggml_cuda_ar_allreduce(pipeline_a, backends, tensors)) {
+        return false;
+    }
+    // Step 2: fold dev2 into dev0's partial sum (tensors[0] now holds t0+t1).
+    ggml_tensor * pair_b[2] = { tensors[0], tensors[2] };
+    if (!ggml_cuda_ar_allreduce(pipeline_b, backends, pair_b)) {
+        return false;
+    }
+    // Step 3: dev0 now holds t0+t1+t2; broadcast it to dev1.  The copy is
+    // enqueued on dev0's compute stream (ordered after both ARs) and dev1's
+    // compute stream waits on the copy event, so downstream ops on dev1 see
+    // the full sum.
+    ggml_backend_tensor_copy_async(backends[0], backends[1], tensors[0], tensors[1]);
+
+    return true;
+}
+
 #else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
 // HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
@@ -965,6 +989,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+    return false;
+}
+bool ggml_cuda_ar_allreduce3(ggml_cuda_ar_pipeline *, ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;
 }
 

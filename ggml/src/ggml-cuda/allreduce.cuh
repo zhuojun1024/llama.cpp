@@ -27,3 +27,14 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// Three-GPU AllReduce composed from two 2-GPU pipelines:
+//   AR(dev0, dev1) -> AR(dev0, dev2) -> copy dev0 -> dev1
+// dev0 (the pivot) participates in both pairwise reductions.  tensors[i] must
+// live on the device managed by backends[i], contiguous F32/F16/BF16, same
+// preconditions as ggml_cuda_ar_allreduce.
+bool ggml_cuda_ar_allreduce3(
+    ggml_cuda_ar_pipeline * pipeline_a,
+    ggml_cuda_ar_pipeline * pipeline_b,
+    ggml_backend_t        * backends,
+    ggml_tensor           ** tensors);
+
