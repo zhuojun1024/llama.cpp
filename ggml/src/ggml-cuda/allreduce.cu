@@ -1245,9 +1245,14 @@ static bool ggml_cuda_ar_ring_impl(
     for (int i = 0; i < n; ++i) {
         max_cb = std::max(max_cb, chunk_bytes[i]);
     }
-    size_t sub_bytes = std::max<size_t>(sizeof(T), max_cb /
-                                                GGML_CUDA_AR_RING_MAX_SUBCHUNKS);
-    sub_bytes = (sub_bytes / sizeof(T)) * sizeof(T);
+    // ceil(max_cb / MAX) rounded UP to a multiple of sizeof(T): sub_bytes is
+    // therefore >= max_cb / MAX, so n_sub = ceil(max_cb / sub_bytes) <= MAX
+    // (rounding sub_bytes down would let the ratio exceed MAX and trip the
+    // assert).
+    size_t sub_bytes = (max_cb + GGML_CUDA_AR_RING_MAX_SUBCHUNKS - 1) /
+                       GGML_CUDA_AR_RING_MAX_SUBCHUNKS;
+    sub_bytes = ((sub_bytes + sizeof(T) - 1) / sizeof(T)) * sizeof(T);
+    sub_bytes = std::max<size_t>(sub_bytes, sizeof(T));
     const size_t n_sub_bytes = (max_cb + sub_bytes - 1) / sub_bytes;
     GGML_ASSERT(n_sub_bytes <= GGML_CUDA_AR_RING_MAX_SUBCHUNKS);
 
