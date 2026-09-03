@@ -982,6 +982,8 @@ struct ggml_backend_cuda_comm_context {
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    // 3-device case: two 2-device pipelines, (dev0, dev1) and (dev0, dev2).
+    ggml_cuda_ar_pipeline *     ar_pipeline_b = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -994,6 +996,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ar_pipeline_free(ar_pipeline_b);
     }
 };
 
@@ -1081,7 +1084,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
     const size_t n_backends = comm_ctx->backends.size();
-    GGML_ASSERT(n_backends == 2);
+    GGML_ASSERT(n_backends == 2 || n_backends == 3);
     GGML_ASSERT(tensors[0] != nullptr);
 
     const int64_t   ne   = ggml_nelements(tensors[0]);
@@ -1118,6 +1121,12 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
             return false;
         }
         GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
+    }
+
+    if (n_backends == 3) {
+        return ggml_cuda_ar_allreduce3(
+            comm_ctx->ar_pipeline, comm_ctx->ar_pipeline_b,
+            comm_ctx->backends.data(), tensors);
     }
 
     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
@@ -1162,15 +1171,32 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
 }
 
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
-    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
-    if (ret->ar_pipeline) {
-        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
-        return;
+    if (ret->dev_ids.size() == 3) {
+        // Compose the 3-device AllReduce from two 2-device pipelines sharing
+        // the pivot device (dev0): (dev0, dev1) and (dev0, dev2).
+        int pair_a[2] = { ret->dev_ids[0], ret->dev_ids[1] };
+        int pair_b[2] = { ret->dev_ids[0], ret->dev_ids[2] };
+        ret->ar_pipeline  = ggml_cuda_ar_pipeline_init(pair_a, 2);
+        ret->ar_pipeline_b = ggml_cuda_ar_pipeline_init(pair_b, 2);
+        if (ret->ar_pipeline && ret->ar_pipeline_b) {
+            ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
+            return;
+        }
+        ggml_cuda_ar_pipeline_free(ret->ar_pipeline);
+        ggml_cuda_ar_pipeline_free(ret->ar_pipeline_b);
+        ret->ar_pipeline  = nullptr;
+        ret->ar_pipeline_b = nullptr;
+    } else {
+        ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
+        if (ret->ar_pipeline) {
+            ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
+            return;
+        }
     }
 
     // Clear sticky CUDA error from the failed init.
     (void) cudaGetLastError();
-    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
+    GGML_LOG_WARN("internal AllReduce init failed (n_devices > 3 or resource allocation failed); "
                   "falling back to meta-backend butterfly\n");
     ggml_backend_cuda_comm_init_none(ret);
 }
