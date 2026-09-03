@@ -963,8 +963,11 @@ bool ggml_cuda_ar_allreduce3(
         return false;
     }
     // Step 2: fold dev2 into dev0's partial sum (tensors[0] now holds t0+t1).
+    // The 2-device path indexes backends[0..1], so pass a pair matching
+    // pipeline_b's devices (dev0, dev2).
     ggml_tensor * pair_b[2] = { tensors[0], tensors[2] };
-    if (!ggml_cuda_ar_allreduce(pipeline_b, backends, pair_b)) {
+    ggml_backend_t backends_b[2] = { backends[0], backends[2] };
+    if (!ggml_cuda_ar_allreduce(pipeline_b, backends_b, pair_b)) {
         return false;
     }
     // Step 3: dev0 now holds t0+t1+t2; broadcast it to dev1.  The copy is
