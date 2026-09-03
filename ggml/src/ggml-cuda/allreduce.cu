@@ -331,6 +331,28 @@ struct ggml_cuda_ar_pipeline {
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
+
+    // Ring AllReduce (n_devices == 3).  Per-device events, all recorded on the
+    // device's own AR stream (streams[i]) except start/end which bridge to the
+    // compute stream.  Only allocated/used when n_devices == 3:
+    //   ring_d2h[i]  : my D2H of this step's send chunk into host_large is done
+    //                  (a receiver waits on its predecessor's ring_d2h).
+    //   ring_h2d[i]  : my H2D read of host_large[predecessor] is done (the
+    //                  predecessor's host_large may be overwritten next step).
+    //   ring_add[i]  : my reduce-scatter add finished reading dev_tmp[i]
+    //                  (dev_tmp[i] may be overwritten next step).
+    //   ring_start[i]: recorded on the COMPUTE stream; AR stream waits on it
+    //                  before reading buf[i] (the producing op is done).
+    //   ring_end[i]  : recorded on the AR stream; compute stream waits on it
+    //                  before consuming the reduced buf[i].
+    cudaEvent_t              ring_d2h[GGML_CUDA_MAX_DEVICES];
+    cudaEvent_t              ring_h2d[GGML_CUDA_MAX_DEVICES];
+    cudaEvent_t              ring_add[GGML_CUDA_MAX_DEVICES];
+    cudaEvent_t              ring_start[GGML_CUDA_MAX_DEVICES];
+    cudaEvent_t              ring_end[GGML_CUDA_MAX_DEVICES];
+    // True once at least one ring step has recorded ring_h2d; the first step
+    // of the very first call skips the (unrecorded) host_large read wait.
+    bool                     ring_h2d_valid;
 };
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
@@ -395,8 +417,8 @@ static void ggml_cuda_ar_wait_for_compute(
 
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
 
-    if (n_devices != 2) {
-        GGML_LOG_DEBUG("%s: internal AllReduce only supports n_devices=2 (got %zu); "
+    if (n_devices != 2 && n_devices != 3) {
+        GGML_LOG_DEBUG("%s: internal AllReduce only supports n_devices=2 or 3 (got %zu); "
                        "falling back\n", __func__, n_devices);
         return nullptr;
     }
@@ -527,6 +549,24 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // Ring AllReduce (3 GPUs): per-device sync events.
+    if (n_devices == 3) {
+        for (size_t i = 0; i < n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            cudaEvent_t * evs[5] = { &p->ring_d2h[i], &p->ring_h2d[i], &p->ring_add[i],
+                                    &p->ring_start[i], &p->ring_end[i] };
+            for (cudaEvent_t * ev : evs) {
+                if (cudaEventCreateWithFlags(ev, cudaEventDisableTiming) != cudaSuccess) {
+                    GGML_LOG_ERROR("%s: cudaEventCreate for ring event failed (device %d)\n",
+                                   __func__, p->devices[i]);
+                    ggml_cuda_ar_pipeline_free(p);
+                    return nullptr;
+                }
+            }
+        }
+        p->ring_h2d_valid = false;
+    }
+
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
@@ -570,6 +610,15 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         if (p->dev_tmp_kernel_done[i]) {
             ggml_cuda_set_device(p->devices[i]);
             cudaEventDestroy(p->dev_tmp_kernel_done[i]);
+        }
+        if (p->n_devices == 3) {
+            ggml_cuda_set_device(p->devices[i]);
+            for (cudaEvent_t ev : { p->ring_d2h[i], p->ring_h2d[i], p->ring_add[i],
+                                   p->ring_start[i], p->ring_end[i] }) {
+                if (ev) {
+                    cudaEventDestroy(ev);
+                }
+            }
         }
         if (p->streams[i]) {
             ggml_cuda_set_device(p->devices[i]);
@@ -979,6 +1028,250 @@ bool ggml_cuda_ar_allreduce3(
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Three-GPU ring AllReduce (copy-engine path).
+//
+// Standard (N-1)-step ring: reduce-scatter, then allgather.  For N = 3 the
+// tensor is split into 3 contiguous chunks, chunk i owned by GPU i.  In each
+// step every GPU sends one chunk to its successor (i -> (i+1) % n) and
+// receives one from its predecessor, so per-GPU traffic is 2*(N-1)/N = 4/3 of
+// the tensor -- 47% less on the busiest (pivot) link than the two-pipeline
+// composition, which moves 5 full tensors.
+//
+// Data path per step, per GPU i (all on i's AR stream unless noted):
+//   D2H: buf[i] chunk -> host_large[i] (pinned), record ring_d2h[i]
+//   H2D: host_large[predecessor] -> dev_tmp[i], record ring_h2d[i]
+//        (waits on predecessor's ring_d2h; host_large is single-buffered so
+//        the predecessor must have finished D2H this step)
+//   add: buf[i] += dev_tmp[i] on the COMPUTE stream (waits on ring_h2d[i]),
+//        record ring_add[i]
+//
+// Single-buffered dev_tmp[i] is protected across consecutive steps/calls:
+// before overwriting dev_tmp[i] the AR stream waits on ring_add[i] (the last
+// add that read it).  host_large[i] likewise: the successor's H2D reads it,
+// so the next D2H into host_large[i] waits on the successor's ring_h2d[i].
+// ring_start/ring_end bridge the AR stream to the compute stream so the
+// producing op and the consuming op are ordered around the ring.
+//
+// Inactive shards (no GGML_TENSOR_FLAG_COMPUTE) are zeroed up front, so the
+// ring arithmetic is a plain sum of the prepared buffers.
+// ---------------------------------------------------------------------------
+
+// One ring step for device i: stage send_chunk to host_large (D2H), pull the
+// predecessor's chunk into dev_tmp (H2D), then either add it into buf (reduce-
+// scatter) or copy it (allgather).  Enforces the single-buffered dev_tmp /
+// host_large hazards with the ring events.  send_chunk and recv_chunk are the
+// per-step chunk indices (recv_chunk == (send_chunk - 1 + n) % n).
+template <typename T>
+static void ggml_cuda_ar_ring_step(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        T                     * buf[GGML_CUDA_MAX_DEVICES],
+        const int64_t         * chunk_ne,
+        const int64_t         * chunk_off,
+        const size_t          * chunk_bytes,
+        size_t                  type_size,
+        int                     i,
+        int                     send_chunk,
+        int                     recv_chunk,
+        bool                    reduce,
+        bool                    skip_hazards) {
+    const int n    = p->n_devices;
+    const int pred = (i + n - 1) % n;
+    const int succ = (i + 1) % n;
+
+    const int64_t send_off = chunk_off[send_chunk];
+    const int64_t recv_off = chunk_off[recv_chunk];
+    const size_t  recv_cb  = chunk_bytes[recv_chunk];
+
+    ggml_cuda_set_device(p->devices[i]);
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+    GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+
+    // dev_tmp[i] may still be read by the previous step's (or previous call's)
+    // add/copy on the compute stream; wait before the H2D overwrites it.
+    // Skipped only when the ring events have never been recorded (the very
+    // first step of the very first call).
+    if (!skip_hazards) {
+        CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ring_add[i]));
+    }
+    // host_large[i] may still be read by the successor's H2D (previous step /
+    // call); wait before the D2H overwrites it.
+    if (!skip_hazards) {
+        CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ring_h2d[succ]));
+    }
+
+    // D2H: stage my send chunk into my pinned host_large.
+    CUDA_CHECK(cudaMemcpyAsync(
+        p->host_large[i].host + send_off * type_size,
+        buf[i] + send_off, chunk_bytes[send_chunk], cudaMemcpyDeviceToHost, p->streams[i]));
+    CUDA_CHECK(cudaEventRecord(p->ring_d2h[i], p->streams[i]));
+
+    // H2D: pull the predecessor's chunk into my dev_tmp.
+    CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ring_d2h[pred]));
+    CUDA_CHECK(cudaMemcpyAsync(
+        p->dev_tmp[i] + recv_off * type_size,
+        p->host_large[pred].host + recv_off * type_size, recv_cb,
+        cudaMemcpyHostToDevice, p->streams[i]));
+    CUDA_CHECK(cudaEventRecord(p->ring_h2d[i], p->streams[i]));
+
+    // Hand off to the compute stream and fold the received chunk in.
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), p->ring_h2d[i]));
+    if (reduce) {
+        const int block_size = 256;
+        int n_blocks = (int) ((chunk_ne[recv_chunk] + block_size - 1) / block_size);
+        if (n_blocks > 1024) {
+            n_blocks = 1024;
+        }
+        ggml_cuda_ar_add_kernel<T, T><<<n_blocks, block_size, 0, cuda_ctx->stream()>>>(
+            buf[i] + recv_off,
+            reinterpret_cast<const T *>(p->dev_tmp[i] + recv_off * type_size),
+            (int) chunk_ne[recv_chunk]);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(
+            buf[i] + recv_off, p->dev_tmp[i] + recv_off * type_size, recv_cb,
+            cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaEventRecord(p->ring_add[i], cuda_ctx->stream()));
+}
+
+template <typename T>
+static bool ggml_cuda_ar_ring_impl(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        T                     * buf[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne,
+        size_t                  type_size) {
+    const int n = p->n_devices;
+    GGML_ASSERT(n == 3);
+    GGML_ASSERT(ne > 0);
+
+    // Split the tensor into n contiguous chunks; chunk i is owned by GPU i.
+    const int64_t base = ne / n;
+    const int64_t rem  = ne % n;
+    int64_t chunk_ne[GGML_CUDA_MAX_DEVICES];
+    int64_t chunk_off[GGML_CUDA_MAX_DEVICES];
+    size_t  chunk_bytes[GGML_CUDA_MAX_DEVICES];
+    for (int i = 0; i < n; ++i) {
+        chunk_ne[i]    = base + (i < rem ? 1 : 0);
+        chunk_off[i]   = i * base + std::min((int64_t) i, rem);
+        chunk_bytes[i] = (size_t) chunk_ne[i] * type_size;
+        GGML_ASSERT(chunk_bytes[i] <= p->copy_bytes);
+    }
+
+    // Bridge the AR streams to the compute streams: the producing op on each
+    // compute stream must finish before any D2H reads buf[i].
+    for (int i = 0; i < n; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+        CUDA_CHECK(cudaEventRecord(p->ring_start[i], cuda_ctx->stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ring_start[i]));
+    }
+
+    // Hazard waits are skipped only for the very first step of the very first
+    // call (the ring events have never been recorded yet).
+    const bool skip_first_hazards = !p->ring_h2d_valid;
+
+    // Reduce-scatter (n-1 steps).  Step s: device i sends chunk (i - s) % n
+    // and adds the received chunk ((i-1) - s) % n.  After the phase, device i
+    // holds the fully-reduced chunk (i + 1) % n.
+    for (int s = 0; s < n - 1; ++s) {
+        for (int i = 0; i < n; ++i) {
+            const int send_chunk = (i - s + n) % n;
+            const int recv_chunk = (i - 1 - s + n) % n;
+            ggml_cuda_ar_ring_step<T>(p, backends, buf, chunk_ne, chunk_off,
+                                      chunk_bytes, type_size, i, send_chunk, recv_chunk,
+                                      /*reduce=*/true,
+                                      /*skip_hazards=*/(s == 0 && skip_first_hazards));
+        }
+    }
+
+    // Allgather (n-1 steps).  Step t: device i sends chunk (i + 1 - t) % n and
+    // copies the received chunk (i - t) % n into its buffer.
+    for (int t = 0; t < n - 1; ++t) {
+        for (int i = 0; i < n; ++i) {
+            const int send_chunk = (i + 1 - t + n) % n;
+            const int recv_chunk = (i - t + n) % n;
+            ggml_cuda_ar_ring_step<T>(p, backends, buf, chunk_ne, chunk_off,
+                                      chunk_bytes, type_size, i, send_chunk, recv_chunk,
+                                      /*reduce=*/false, /*skip_hazards=*/false);
+        }
+    }
+
+    p->ring_h2d_valid = true;
+    return true;
+}
+
+size_t ggml_cuda_ar_ring_max_bytes(ggml_cuda_ar_pipeline * p) {
+    GGML_ASSERT(p != nullptr);
+    // Conservative, type-independent bound: assume the largest element (4 B).
+    // Largest nbytes such that every chunk (ceil(ne/n) elements) fits in the
+    // per-device staging: ne_max = n * (copy_bytes / 4), minus worst-case
+    // remainder slack of (n-1) elements.
+    const size_t elems_per_chunk = p->copy_bytes / 4;
+    if (elems_per_chunk == 0) {
+        return 0;
+    }
+    const size_t ne_max = (size_t) p->n_devices * elems_per_chunk;
+    return (ne_max > (size_t) p->n_devices - 1) ?
+        (ne_max - ((size_t) p->n_devices - 1)) * 4 : 0;
+}
+
+bool ggml_cuda_ar_allreduce_ring(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    GGML_ASSERT(p != nullptr);
+    GGML_ASSERT(p->n_devices == 3);
+
+    const int n = p->n_devices;
+    const int64_t ne = ggml_nelements(tensors[0]);
+    GGML_ASSERT(ne > 0);
+
+    const ggml_type input_type = tensors[0]->type;
+    GGML_ASSERT(input_type == GGML_TYPE_F32 || input_type == GGML_TYPE_F16 || input_type == GGML_TYPE_BF16);
+    const size_t type_size = ggml_type_size(input_type);
+
+    // Inactive shards contribute zeros.
+    for (int i = 0; i < n; ++i) {
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+            ggml_cuda_set_device(p->devices[i]);
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, (size_t) ne * type_size, cuda_ctx->stream()));
+        }
+    }
+
+    switch (input_type) {
+        case GGML_TYPE_F32: {
+            float * buf[GGML_CUDA_MAX_DEVICES] = {};
+            for (int i = 0; i < n; ++i) {
+                buf[i] = static_cast<float *>(tensors[i]->data);
+            }
+            return ggml_cuda_ar_ring_impl<float>(p, backends, buf, ne, type_size);
+        }
+        case GGML_TYPE_F16: {
+            half * buf[GGML_CUDA_MAX_DEVICES] = {};
+            for (int i = 0; i < n; ++i) {
+                buf[i] = static_cast<half *>(tensors[i]->data);
+            }
+            return ggml_cuda_ar_ring_impl<half>(p, backends, buf, ne, type_size);
+        }
+        case GGML_TYPE_BF16: {
+            nv_bfloat16 * buf[GGML_CUDA_MAX_DEVICES] = {};
+            for (int i = 0; i < n; ++i) {
+                buf[i] = static_cast<nv_bfloat16 *>(tensors[i]->data);
+            }
+            return ggml_cuda_ar_ring_impl<nv_bfloat16>(p, backends, buf, ne, type_size);
+        }
+        default:
+            GGML_ASSERT(false);
+            return false;
+    }
+}
+
 #else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
 // HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
@@ -996,6 +1289,12 @@ bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tens
 }
 bool ggml_cuda_ar_allreduce3(ggml_cuda_ar_pipeline *, ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;
+}
+bool ggml_cuda_ar_allreduce_ring(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+    return false;
+}
+size_t ggml_cuda_ar_ring_max_bytes(ggml_cuda_ar_pipeline *, size_t) {
+    return 0;
 }
 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

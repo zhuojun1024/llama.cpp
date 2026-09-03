@@ -38,3 +38,20 @@ bool ggml_cuda_ar_allreduce3(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// Three-GPU ring AllReduce (copy-engine path): (N-1)-step reduce-scatter +
+// allgather, 2*(N-1)/N = 4/3 tensor of per-GPU traffic vs 5 full tensors for
+// the two-pipeline composition.  Targets bandwidth-bound (large) tensors;
+// the caller keeps small (latency-bound) tensors on the two-pipeline path.
+// Same preconditions as ggml_cuda_ar_allreduce; pipeline must be a
+// 3-device pipeline.
+bool ggml_cuda_ar_allreduce_ring(
+    ggml_cuda_ar_pipeline * pipeline,
+    ggml_backend_t        * backends,
+    ggml_tensor           ** tensors);
+
+// Largest nbytes the ring path can handle in one call: each of the n chunks
+// must fit in the per-device copy-engine staging (copy_bytes).  Conservative
+// (assumes 4-byte elements).  Tensors above this should use the two-pipeline
+// path, which outer-chunks large reductions.
+size_t ggml_cuda_ar_ring_max_bytes(ggml_cuda_ar_pipeline * pipeline);
+

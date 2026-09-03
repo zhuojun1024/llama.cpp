@@ -982,8 +982,17 @@ struct ggml_backend_cuda_comm_context {
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
-    // 3-device case: two 2-device pipelines, (dev0, dev1) and (dev0, dev2).
+    // 3-device case: two 2-device pipelines, (dev0, dev1) and (dev0, dev2),
+    // used for small (latency-bound) tensors via the chunked-kernel path.
     ggml_cuda_ar_pipeline *     ar_pipeline_b = nullptr;
+    // 3-device case: a single 3-device pipeline for the ring AllReduce, used
+    // for large (bandwidth-bound) tensors.  nullptr if ring is disabled or
+    // init failed.
+    ggml_cuda_ar_pipeline *     ar_ring = nullptr;
+    // nbytes at or above which the 3-device ring path is preferred over the
+    // two-pipeline composition.  Override via GGML_CUDA_AR3_RING_THRESHOLD
+    // (bytes); 0 disables the ring entirely (always two-pipeline).
+    size_t                      ring_threshold = 0;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -997,6 +1006,7 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
         ggml_cuda_ar_pipeline_free(ar_pipeline_b);
+        ggml_cuda_ar_pipeline_free(ar_ring);
     }
 };
 
@@ -1124,6 +1134,17 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     }
 
     if (n_backends == 3) {
+        // Large tensors: ring (4/3 tensor per GPU of traffic).  Small tensors:
+        // two-pipeline composition (lower fixed latency).  Tensors above the
+        // ring's single-call staging capacity fall back to two-pipeline, which
+        // outer-chunks large reductions.
+        const size_t nbytes = ggml_nbytes(tensors[0]);
+        if (comm_ctx->ar_ring != nullptr &&
+            nbytes >= comm_ctx->ring_threshold &&
+            nbytes <= ggml_cuda_ar_ring_max_bytes(comm_ctx->ar_ring)) {
+            return ggml_cuda_ar_allreduce_ring(
+                comm_ctx->ar_ring, comm_ctx->backends.data(), tensors);
+        }
         return ggml_cuda_ar_allreduce3(
             comm_ctx->ar_pipeline, comm_ctx->ar_pipeline_b,
             comm_ctx->backends.data(), tensors);
@@ -1173,19 +1194,43 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
     if (ret->dev_ids.size() == 3) {
         // Compose the 3-device AllReduce from two 2-device pipelines sharing
-        // the pivot device (dev0): (dev0, dev1) and (dev0, dev2).
+        // the pivot device (dev0): (dev0, dev1) and (dev0, dev2).  This is the
+        // low-latency path for small tensors (chunked kernel, in-kernel sync).
         int pair_a[2] = { ret->dev_ids[0], ret->dev_ids[1] };
         int pair_b[2] = { ret->dev_ids[0], ret->dev_ids[2] };
         ret->ar_pipeline  = ggml_cuda_ar_pipeline_init(pair_a, 2);
         ret->ar_pipeline_b = ggml_cuda_ar_pipeline_init(pair_b, 2);
-        if (ret->ar_pipeline && ret->ar_pipeline_b) {
+        if (!(ret->ar_pipeline && ret->ar_pipeline_b)) {
+            ggml_cuda_ar_pipeline_free(ret->ar_pipeline);
+            ggml_cuda_ar_pipeline_free(ret->ar_pipeline_b);
+            ret->ar_pipeline  = nullptr;
+            ret->ar_pipeline_b = nullptr;
+        } else {
+            // Large (bandwidth-bound) tensors use the ring AllReduce, which
+            // moves 4/3 of the tensor per GPU vs 5 full tensors for the
+            // two-pipeline composition.  Disabled when the threshold env var
+            // is 0 (default: use the copy-engine threshold, 1 MB).
+            const char * env = getenv("GGML_CUDA_AR3_RING_THRESHOLD");
+            uint64_t thr = 1024 * 1024;
+            if (env && env[0]) {
+                char * end = nullptr;
+                const unsigned long long parsed = strtoull(env, &end, 10);
+                if (end != env) {
+                    thr = (uint64_t) parsed;
+                }
+            }
+            ret->ring_threshold = (size_t) thr;
+            if (ret->ring_threshold > 0) {
+                ret->ar_ring = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), 3);
+                if (ret->ar_ring) {
+                    GGML_LOG_INFO("3-device AllReduce: two-pipeline (small) + ring (large, >= %zu bytes); "
+                                  "set GGML_CUDA_AR3_RING_THRESHOLD=0 to disable ring\n",
+                                  ret->ring_threshold);
+                }
+            }
             ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
             return;
         }
-        ggml_cuda_ar_pipeline_free(ret->ar_pipeline);
-        ggml_cuda_ar_pipeline_free(ret->ar_pipeline_b);
-        ret->ar_pipeline  = nullptr;
-        ret->ar_pipeline_b = nullptr;
     } else {
         ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
         if (ret->ar_pipeline) {
