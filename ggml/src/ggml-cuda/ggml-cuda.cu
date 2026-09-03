@@ -1206,12 +1206,16 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
             ret->ar_pipeline  = nullptr;
             ret->ar_pipeline_b = nullptr;
         } else {
-            // Large (bandwidth-bound) tensors use the ring AllReduce, which
-            // moves 4/3 of the tensor per GPU vs 5 full tensors for the
-            // two-pipeline composition.  Disabled when the threshold env var
-            // is 0 (default: use the copy-engine threshold, 1 MB).
+            // The ring AllReduce moves 4/3 of the tensor per GPU vs 5 full
+            // tensors for the two-pipeline composition, but on this hardware
+            // (mixed PCIe generations, no P2P, Windows cross-device event
+            // sync) the extra handshake count and the T10 link staying on the
+            // critical path every step make it slower for large tensors
+            // (~455 vs ~556 t/s prefill).  It is therefore DISABLED by
+            // default; set GGML_CUDA_AR3_RING_THRESHOLD to a byte count to
+            // opt in for experiments.
             const char * env = getenv("GGML_CUDA_AR3_RING_THRESHOLD");
-            uint64_t thr = 1024 * 1024;
+            uint64_t thr = 0;
             if (env && env[0]) {
                 char * end = nullptr;
                 const unsigned long long parsed = strtoull(env, &end, 10);
@@ -1224,7 +1228,7 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
                 ret->ar_ring = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), 3);
                 if (ret->ar_ring) {
                     GGML_LOG_INFO("3-device AllReduce: two-pipeline (small) + ring (large, >= %zu bytes); "
-                                  "set GGML_CUDA_AR3_RING_THRESHOLD=0 to disable ring\n",
+                                  "ring disabled by default, GGML_CUDA_AR3_RING_THRESHOLD=0 keeps it off\n",
                                   ret->ring_threshold);
                 }
             }
