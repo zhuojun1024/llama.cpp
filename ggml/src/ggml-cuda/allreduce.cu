@@ -1097,6 +1097,8 @@ static void ggml_cuda_ar_ring_step(
         const int64_t         * chunk_ne,
         const int64_t         * chunk_off,
         const size_t          * chunk_bytes,
+        size_t                  sub_bytes,
+        size_t                  n_sub_bytes,
         int                     i,
         int                     send_chunk,
         int                     recv_chunk,
@@ -1129,11 +1131,14 @@ static void ggml_cuda_ar_ring_step(
         CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ring_h2d[succ]));
     }
 
-    // Subchunking: ~RING_MAX_SUBCHUNKS pieces in flight per direction.
-    size_t sub = std::max<size_t>(type_size, std::min(send_cb, recv_cb) /
-                                        GGML_CUDA_AR_RING_MAX_SUBCHUNKS);
-    sub = (sub / type_size) * type_size;
-    const size_t n_sub = (send_cb + sub - 1) / sub;
+    // Subchunking: sub_bytes / n_sub are computed once per call in ring_impl
+    // from the LARGEST chunk, so every device records exactly n_sub D2H
+    // events (a receiver's wait on ring_d2h[pred][c] is always satisfied) and
+    // n_sub <= RING_MAX_SUBCHUNKS holds by construction.  A subchunk that
+    // overruns a smaller chunk is a 0-byte no-op (the event is still
+    // recorded/waited on to keep the count uniform).
+    const size_t sub = sub_bytes;
+    const size_t n_sub = n_sub_bytes;
     GGML_ASSERT(n_sub <= GGML_CUDA_AR_RING_MAX_SUBCHUNKS);
 
     // D2H: stage my send chunk into my pinned host_large, subchunk by
@@ -1141,11 +1146,13 @@ static void ggml_cuda_ar_ring_step(
     // H2D as soon as that piece lands.
     for (size_t c = 0; c < n_sub; ++c) {
         const size_t off     = c * sub;
-        const size_t this_cb = std::min(sub, send_cb - off);
-        CUDA_CHECK(cudaMemcpyAsync(
-            p->host_large[i].host + (send_off * type_size + off),
-            buf[i] + send_off + off / type_size, this_cb,
-            cudaMemcpyDeviceToHost, p->streams[i]));
+        const size_t this_cb = off < send_cb ? std::min(sub, send_cb - off) : 0;
+        if (this_cb > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                p->host_large[i].host + (send_off * type_size + off),
+                buf[i] + send_off + off / type_size, this_cb,
+                cudaMemcpyDeviceToHost, p->streams[i]));
+        }
         CUDA_CHECK(cudaEventRecord(p->ring_d2h[i][c], p->streams[i]));
     }
 
@@ -1153,12 +1160,14 @@ static void ggml_cuda_ar_ring_step(
     // subchunk; each waits only on the matching predecessor D2H event.
     for (size_t c = 0; c < n_sub; ++c) {
         const size_t off     = c * sub;
-        const size_t this_cb = std::min(sub, recv_cb - off);
+        const size_t this_cb = off < recv_cb ? std::min(sub, recv_cb - off) : 0;
         CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ring_d2h[pred][c]));
-        CUDA_CHECK(cudaMemcpyAsync(
-            p->dev_tmp[i] + recv_off * type_size + off,
-            p->host_large[pred].host + recv_off * type_size + off, this_cb,
-            cudaMemcpyHostToDevice, p->streams[i]));
+        if (this_cb > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                p->dev_tmp[i] + recv_off * type_size + off,
+                p->host_large[pred].host + recv_off * type_size + off, this_cb,
+                cudaMemcpyHostToDevice, p->streams[i]));
+        }
     }
     // All of my H2D reads of host_large[pred] are now queued; the
     // predecessor may overwrite that region next step once this lands.
@@ -1228,6 +1237,20 @@ static bool ggml_cuda_ar_ring_impl(
     // call (the ring events have never been recorded yet).
     const bool skip_first_hazards = !p->ring_h2d_valid;
 
+    // Uniform subchunk geometry, derived from the LARGEST chunk so that
+    // ceil(largest / sub) <= RING_MAX_SUBCHUNKS and every device records the
+    // same number of D2H events per step (a receiver's wait on
+    // ring_d2h[pred][c] is always satisfied).
+    size_t max_cb = 0;
+    for (int i = 0; i < n; ++i) {
+        max_cb = std::max(max_cb, chunk_bytes[i]);
+    }
+    size_t sub_bytes = std::max<size_t>(sizeof(T), max_cb /
+                                                GGML_CUDA_AR_RING_MAX_SUBCHUNKS);
+    sub_bytes = (sub_bytes / sizeof(T)) * sizeof(T);
+    const size_t n_sub_bytes = (max_cb + sub_bytes - 1) / sub_bytes;
+    GGML_ASSERT(n_sub_bytes <= GGML_CUDA_AR_RING_MAX_SUBCHUNKS);
+
     // Reduce-scatter (n-1 steps).  Step s: device i sends chunk (i - s) % n
     // and adds the received chunk ((i-1) - s) % n.  After the phase, device i
     // holds the fully-reduced chunk (i + 1) % n.
@@ -1236,7 +1259,8 @@ static bool ggml_cuda_ar_ring_impl(
             const int send_chunk = (i - s + n) % n;
             const int recv_chunk = (i - 1 - s + n) % n;
             ggml_cuda_ar_ring_step<T>(p, backends, buf, chunk_ne, chunk_off,
-                                      chunk_bytes, i, send_chunk, recv_chunk,
+                                      chunk_bytes, sub_bytes, n_sub_bytes,
+                                      i, send_chunk, recv_chunk,
                                       /*reduce=*/true,
                                       /*skip_hazards=*/(s == 0 && skip_first_hazards));
         }
@@ -1249,7 +1273,8 @@ static bool ggml_cuda_ar_ring_impl(
             const int send_chunk = (i + 1 - t + n) % n;
             const int recv_chunk = (i - t + n) % n;
             ggml_cuda_ar_ring_step<T>(p, backends, buf, chunk_ne, chunk_off,
-                                      chunk_bytes, i, send_chunk, recv_chunk,
+                                      chunk_bytes, sub_bytes, n_sub_bytes,
+                                      i, send_chunk, recv_chunk,
                                       /*reduce=*/false, /*skip_hazards=*/false);
         }
     }
