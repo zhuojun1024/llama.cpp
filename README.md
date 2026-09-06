@@ -17,6 +17,26 @@
 
 </div>
 
+## Fork branches
+
+This fork targets 3-GPU inference on a mixed PCIe topology without P2P (two RTX 5060 Ti + one Tesla T10), where the upstream multi-GPU path cannot AllReduce across all three devices. All branches are based on upstream master plus the common fixes listed below.
+
+| Branch | AllReduce approach |
+|--------|--------------------|
+| `ar3-opt` (recommended) | 3-device AllReduce: two 2-device pipelines for small tensors, plus a dedicated copy-engine path for large F32 tensors (BF16 wire, F32 accumulate, keeps the slow PCIe link off the critical path) |
+| `ar3-dual` | 3-device AllReduce composed of two 2-device pipelines: AR(dev0,dev1) -> AR(dev0,dev2) -> broadcast dev0 to dev1 |
+| `ar3-ring` | 3-device ring AllReduce for large tensors (BF16 wire, subchunked D2H/H2D), disabled by default |
+| `all` | integration branch: upstream master + common fixes, no 3-device AllReduce |
+
+`ar3-opt` and `all` track the newest upstream master; `ar3-dual` and `ar3-ring` are based on an older master and are kept for reference.
+
+Common to all branches:
+
+- ggml-cuda: fix winsock.h conflict with NCCL headers on Windows
+- mtmd: tensor split for CLIP mmproj across multiple GPUs
+- `-sm tensor` split mode support
+- docs: local Windows build notes
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
