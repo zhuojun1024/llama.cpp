@@ -984,6 +984,8 @@ struct ggml_backend_cuda_comm_context {
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
     // 3-device case: two 2-device pipelines, (dev0, dev1) and (dev0, dev2).
     ggml_cuda_ar_pipeline *     ar_pipeline_b = nullptr;
+    // 3-device large-tensor copy-engine sync state (dedicated staging/events).
+    ggml_cuda_ar3_sync *        ar3_sync = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -997,6 +999,7 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
         ggml_cuda_ar_pipeline_free(ar_pipeline_b);
+        ggml_cuda_ar3_sync_free(ar3_sync);
     }
 };
 
@@ -1125,7 +1128,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
 
     if (n_backends == 3) {
         return ggml_cuda_ar_allreduce3(
-            comm_ctx->ar_pipeline, comm_ctx->ar_pipeline_b,
+            comm_ctx->ar_pipeline, comm_ctx->ar_pipeline_b, comm_ctx->ar3_sync,
             comm_ctx->backends.data(), tensors);
     }
 
@@ -1178,14 +1181,19 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
         int pair_b[2] = { ret->dev_ids[0], ret->dev_ids[2] };
         ret->ar_pipeline  = ggml_cuda_ar_pipeline_init(pair_a, 2);
         ret->ar_pipeline_b = ggml_cuda_ar_pipeline_init(pair_b, 2);
+        // 3-device large-tensor copy-engine staging, sized like the pipeline's
+        // copy-engine buffer (GGML_CUDA_AR_COPY_MAX_BYTES).
+        ret->ar3_sync = ggml_cuda_ar3_sync_init(ret->dev_ids.data(), 32 * 1024 * 1024);
         if (ret->ar_pipeline && ret->ar_pipeline_b) {
             ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
             return;
         }
         ggml_cuda_ar_pipeline_free(ret->ar_pipeline);
         ggml_cuda_ar_pipeline_free(ret->ar_pipeline_b);
+        ggml_cuda_ar3_sync_free(ret->ar3_sync);
         ret->ar_pipeline  = nullptr;
         ret->ar_pipeline_b = nullptr;
+        ret->ar3_sync = nullptr;
     } else {
         ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
         if (ret->ar_pipeline) {

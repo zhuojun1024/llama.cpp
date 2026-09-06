@@ -581,6 +581,351 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 }
 
 // ---------------------------------------------------------------------------
+// 3-device copy-engine AllReduce (plan 4, v2)
+//
+// Dedicated routine for large tensors (nbytes >= copy_threshold).  The
+// 2-pipeline path (AR(dev0,dev1) -> AR(dev0,dev2) -> F32 broadcast) puts the
+// slow T10 link (dev1) on the critical path every step and broadcasts the full
+// F32 sum.  This routine instead:
+//
+//   P1: D2H t0->hostA0, t1->hostA1, t2->hostB1  (all three in parallel)
+//   P2: dev0 H2D hostA1 + add, dev1 H2D hostA0 + add   (AR1: t0+t1)
+//   P3: dev0 D2H(t0+t1)->hostB0; dev0 H2D hostB1 + add;
+//       dev1 H2D hostB1 + add; dev2 H2D hostB0 + add   (fold in t2)
+//
+// Wire type is BF16 (halves the bytes vs the F32 broadcast); accumulation is
+// F32.  Critical path = dev1: D2H t1 + H2D t0 + H2D t2 = 3W on the slowest
+// link.  Uses its own staging buffers (separate from the 2-GPU pipeline's) so
+// the two paths never share a buffer and no cross-path hazard exists.
+// ---------------------------------------------------------------------------
+
+struct ggml_cuda_ar3_sync {
+    // Dedicated staging, indexed: 0=A0(dev0), 1=A1(dev1), 2=B0(dev0), 3=B1(dev2).
+    ggml_cuda_ar_host_mapping host[4];
+    char *                    dev_tmp[4];
+    size_t                    buf_bytes;
+
+    enum : int {
+        EV_APP0, EV_APP1, EV_APP2,            // compute->AR after BF16 convert
+        EV_D2H0, EV_D2H1, EV_D2H2,            // P1 D2H done (t0, t1, t2)
+        EV_D2H_T0T1,                          // P3 D2H(t0+t1) done
+        EV_H2D_ADD0, EV_H2D_ADD1, EV_H2D_ADD2, EV_H2D_ADD3, EV_H2D_ADD4, // H2D->add
+        EV_CONVERT_D2H,                       // dev0 convert(t0+t1)->D2H
+        EV_READ_A0, EV_READ_A1, EV_READ_B0, EV_READ_B1_DEV0, EV_READ_B1_DEV1,
+        EV_DEV1_ADD_P2,                       // intra-AR: dev1 P2 add done
+        EV_COUNT
+    };
+    cudaEvent_t ev[EV_COUNT];
+    bool        read_valid[5];                // 0=A0, 1=A1, 2=B0, 3=B1_dev0, 4=B1_dev1
+};
+
+ggml_cuda_ar3_sync * ggml_cuda_ar3_sync_init(const int * devices, size_t buf_bytes) {
+    GGML_ASSERT(devices != nullptr);
+    auto * s = new ggml_cuda_ar3_sync{};
+    s->buf_bytes = buf_bytes;
+
+    // host[i] / dev_tmp[i] live on: 0->dev0, 1->dev1, 2->dev0, 3->dev2.
+    const int owner[4] = { devices[0], devices[1], devices[0], devices[2] };
+    for (int i = 0; i < 4; ++i) {
+        if (s->host[i].alloc(buf_bytes) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: alloc for 3-device host staging %d failed (%zu bytes)\n",
+                           __func__, i, buf_bytes);
+            ggml_cuda_ar3_sync_free(s);
+            return nullptr;
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        ggml_cuda_set_device(owner[i]);
+        if (cudaMalloc(reinterpret_cast<void **>(&s->dev_tmp[i]), buf_bytes) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: alloc for 3-device scratch %d failed (%zu bytes) on device %d\n",
+                           __func__, i, buf_bytes, owner[i]);
+            ggml_cuda_ar3_sync_free(s);
+            return nullptr;
+        }
+    }
+    // Events must be created on the device that records them (cross-device
+    // wait is fine, cross-device record is not).  Map each event to its
+    // recording device:
+    //   dev0: EV_APP0 (compute0), EV_D2H0 (sA0), EV_H2D_ADD0 (sA0),
+    //         EV_CONVERT_D2H (compute0), EV_D2H_T0T1 (sB0), EV_H2D_ADD2 (sB0),
+    //         EV_READ_B1_DEV0 (sB0)
+    //   dev1: EV_APP1 (compute1), EV_D2H1 (sA1), EV_H2D_ADD1 (sA1),
+    //         EV_READ_A0 (sA1), EV_H2D_ADD3 (sA1), EV_READ_B1_DEV1 (sA1),
+    //         EV_DEV1_ADD_P2 (compute1)
+    //   dev2: EV_APP2 (compute2), EV_D2H2 (sB1), EV_READ_A1 (sB1),
+    //         EV_READ_B0 (sB1)
+    using E = ggml_cuda_ar3_sync;
+    const int rec_dev[E::EV_COUNT] = {
+        devices[0], // EV_APP0
+        devices[1], // EV_APP1
+        devices[2], // EV_APP2
+        devices[0], // EV_D2H0
+        devices[1], // EV_D2H1
+        devices[2], // EV_D2H2
+        devices[0], // EV_D2H_T0T1
+        devices[0], // EV_H2D_ADD0
+        devices[1], // EV_H2D_ADD1
+        devices[0], // EV_H2D_ADD2
+        devices[1], // EV_H2D_ADD3
+        devices[2], // EV_H2D_ADD4
+        devices[0], // EV_CONVERT_D2H
+        devices[1], // EV_READ_A0  (recorded on sA1 in P2 dev1 block)
+        devices[0], // EV_READ_A1  (recorded on sA0 in P2 dev0 block)
+        devices[2], // EV_READ_B0  (recorded on sB1 in P3 dev2 block)
+        devices[0], // EV_READ_B1_DEV0 (recorded on sB0 in P3 dev0 block)
+        devices[1], // EV_READ_B1_DEV1 (recorded on sA1 in P3 dev1 block)
+        devices[1], // EV_DEV1_ADD_P2
+    };
+    for (int i = 0; i < E::EV_COUNT; ++i) {
+        ggml_cuda_set_device(rec_dev[i]);
+        if (cudaEventCreateWithFlags(&s->ev[i], cudaEventDisableTiming) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cudaEventCreate for 3-device sync event %d failed\n",
+                           __func__, i);
+            ggml_cuda_ar3_sync_free(s);
+            return nullptr;
+        }
+    }
+    return s;
+}
+
+void ggml_cuda_ar3_sync_free(ggml_cuda_ar3_sync * s) {
+    if (!s) {
+        return;
+    }
+    for (int i = 0; i < 4; ++i) {
+        s->host[i].free();
+        if (s->dev_tmp[i]) {
+            cudaFree(s->dev_tmp[i]);
+            s->dev_tmp[i] = nullptr;
+        }
+    }
+    for (int i = 0; i < ggml_cuda_ar3_sync::EV_COUNT; ++i) {
+        if (s->ev[i]) {
+            cudaEventDestroy(s->ev[i]);
+            s->ev[i] = nullptr;
+        }
+    }
+    delete s;
+}
+
+// One slice of the 3-device copy-engine reduction (nbytes <= buf_bytes).
+// BF16 wire, F32 accumulate.  data is the per-slice F32 accumulator; bf16_in
+// is the per-slice BF16 input (converted once up-front by the caller, so no
+// per-slice input conversion races the prior slice's D2H on a reused buffer).
+// The P3 t0+t1 wire buffer is converted here (only available after P2) into a
+// local scratch that is freed at end of slice.
+static bool ggml_cuda_ar3_copy_impl(
+        ggml_cuda_ar_pipeline * pa,
+        ggml_cuda_ar_pipeline * pb,
+        ggml_cuda_ar3_sync    * s,
+        ggml_backend_t        * backends,
+        float * const           data[3],
+        nv_bfloat16 * const     bf16_in[3],
+        int64_t                 ne,
+        const bool              compute[3]) {
+    const size_t nbytes = (size_t) ne * sizeof(nv_bfloat16);
+    GGML_ASSERT(nbytes <= s->buf_bytes);
+    GGML_ASSERT(ne <= std::numeric_limits<int>::max());
+
+    const int dev0 = pa->devices[0];
+    const int dev1 = pa->devices[1];
+    const int dev2 = pb->devices[1];
+
+    ggml_backend_cuda_context * ctx[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+    }
+
+    // P3 wire buffer: holds the t0+t1 partial sum in BF16 for dev2.  Converted
+    // per slice (only exists after P2); freed at end of slice.  Reuse across
+    // slices is safe: the next slice's P3 convert (compute0) is ordered after
+    // this slice's P3 D2H (sB0) via the P3 add -> app-event chain.
+    ggml_cuda_pool_alloc<nv_bfloat16> bf16_wire;
+    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+    {
+        ggml_cuda_set_device(dev0);
+        bf16_wire.pool = &ctx[0]->pool();
+        bf16_wire.alloc(ne);
+    }
+
+    // Record app events: the AR streams wait on these before the P1 D2Hs, so
+    // the D2Hs run after the upstream compute (and after the prior slice/AR's
+    // adds, since the compute stream is ordered).
+    for (int i = 0; i < 3; ++i) {
+        const int dev = (i == 2) ? dev2 : pa->devices[i];
+        ggml_cuda_set_device(dev);
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_APP0 + i], ctx[i]->stream()));
+    }
+
+    const char * hostA0 = reinterpret_cast<const char *>(s->host[0].host);
+    const char * hostA1 = reinterpret_cast<const char *>(s->host[1].host);
+    const char * hostB0 = reinterpret_cast<const char *>(s->host[2].host);
+    const char * hostB1 = reinterpret_cast<const char *>(s->host[3].host);
+    char * tmpA0  = s->dev_tmp[0];
+    char * tmpA1  = s->dev_tmp[1];
+    char * tmpB0  = s->dev_tmp[2];
+    char * tmpB1  = s->dev_tmp[3];
+    cudaStream_t sA0 = pa->streams[0];
+    cudaStream_t sA1 = pa->streams[1];
+    cudaStream_t sB0 = pb->streams[0];
+    cudaStream_t sB1 = pb->streams[1];
+
+    const int n_blocks = std::min(1024, (int) ((ne + 255) / 256));
+
+    // P1: D2H t0->hostA0, t1->hostA1, t2->hostB1 (all in parallel).
+    {
+        ggml_cuda_set_device(dev0);
+        CUDA_CHECK(cudaStreamWaitEvent(sA0, s->ev[ggml_cuda_ar3_sync::EV_APP0]));
+        if (s->read_valid[0]) CUDA_CHECK(cudaStreamWaitEvent(sA0, s->ev[ggml_cuda_ar3_sync::EV_READ_A0]));
+        CUDA_CHECK(cudaMemcpyAsync(s->host[0].host, bf16_in[0], nbytes, cudaMemcpyDeviceToHost, sA0));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_D2H0], sA0));
+    }
+    {
+        ggml_cuda_set_device(dev1);
+        CUDA_CHECK(cudaStreamWaitEvent(sA1, s->ev[ggml_cuda_ar3_sync::EV_APP1]));
+        if (s->read_valid[1]) CUDA_CHECK(cudaStreamWaitEvent(sA1, s->ev[ggml_cuda_ar3_sync::EV_READ_A1]));
+        CUDA_CHECK(cudaMemcpyAsync(s->host[1].host, bf16_in[1], nbytes, cudaMemcpyDeviceToHost, sA1));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_D2H1], sA1));
+    }
+    {
+        ggml_cuda_set_device(dev2);
+        CUDA_CHECK(cudaStreamWaitEvent(sB1, s->ev[ggml_cuda_ar3_sync::EV_APP2]));
+        if (s->read_valid[3]) CUDA_CHECK(cudaStreamWaitEvent(sB1, s->ev[ggml_cuda_ar3_sync::EV_READ_B1_DEV0]));
+        if (s->read_valid[4]) CUDA_CHECK(cudaStreamWaitEvent(sB1, s->ev[ggml_cuda_ar3_sync::EV_READ_B1_DEV1]));
+        CUDA_CHECK(cudaMemcpyAsync(s->host[3].host, bf16_in[2], nbytes, cudaMemcpyDeviceToHost, sB1));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_D2H2], sB1));
+    }
+
+    // P2: AR1 stage 2.  dev0 += t1, dev1 += t0  ->  both hold t0+t1.
+    {
+        ggml_cuda_set_device(dev0);
+        CUDA_CHECK(cudaStreamWaitEvent(sA0, s->ev[ggml_cuda_ar3_sync::EV_D2H1]));
+        CUDA_CHECK(cudaMemcpyAsync(tmpA0, hostA1, nbytes, cudaMemcpyHostToDevice, sA0));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_READ_A1], sA0));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD0], sA0));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[0]->stream(), s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD0]));
+        ggml_cuda_ar_add_kernel<float, nv_bfloat16><<<n_blocks, 256, 0, ctx[0]->stream()>>>(
+            data[0], reinterpret_cast<const nv_bfloat16 *>(tmpA0), (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        ggml_cuda_set_device(dev1);
+        CUDA_CHECK(cudaStreamWaitEvent(sA1, s->ev[ggml_cuda_ar3_sync::EV_D2H0]));
+        CUDA_CHECK(cudaMemcpyAsync(tmpA1, hostA0, nbytes, cudaMemcpyHostToDevice, sA1));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_READ_A0], sA1));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD1], sA1));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[1]->stream(), s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD1]));
+        ggml_cuda_ar_add_kernel<float, nv_bfloat16><<<n_blocks, 256, 0, ctx[1]->stream()>>>(
+            data[1], reinterpret_cast<const nv_bfloat16 *>(tmpA1), (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_DEV1_ADD_P2], ctx[1]->stream()));
+    }
+
+    // P3: fold in t2.  dev0 publishes t0+t1 (BF16) to hostB0 for dev2.
+    {
+        ggml_cuda_set_device(dev0);
+        to_bf16(data[0], bf16_wire.get(), ne, ctx[0]->stream());
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_CONVERT_D2H], ctx[0]->stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(sB0, s->ev[ggml_cuda_ar3_sync::EV_CONVERT_D2H]));
+        if (s->read_valid[2]) CUDA_CHECK(cudaStreamWaitEvent(sB0, s->ev[ggml_cuda_ar3_sync::EV_READ_B0]));
+        CUDA_CHECK(cudaMemcpyAsync(s->host[2].host, bf16_wire.get(), nbytes, cudaMemcpyDeviceToHost, sB0));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_D2H_T0T1], sB0));
+        CUDA_CHECK(cudaStreamWaitEvent(sB0, s->ev[ggml_cuda_ar3_sync::EV_D2H2]));
+        CUDA_CHECK(cudaMemcpyAsync(tmpB0, hostB1, nbytes, cudaMemcpyHostToDevice, sB0));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_READ_B1_DEV0], sB0));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD2], sB0));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[0]->stream(), s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD2]));
+        ggml_cuda_ar_add_kernel<float, nv_bfloat16><<<n_blocks, 256, 0, ctx[0]->stream()>>>(
+            data[0], reinterpret_cast<const nv_bfloat16 *>(tmpB0), (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        ggml_cuda_set_device(dev1);
+        CUDA_CHECK(cudaStreamWaitEvent(sA1, s->ev[ggml_cuda_ar3_sync::EV_D2H2]));
+        // tmpA1 was last read by the P2 add; wait for it before overwriting.
+        CUDA_CHECK(cudaStreamWaitEvent(sA1, s->ev[ggml_cuda_ar3_sync::EV_DEV1_ADD_P2]));
+        CUDA_CHECK(cudaMemcpyAsync(tmpA1, hostB1, nbytes, cudaMemcpyHostToDevice, sA1));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_READ_B1_DEV1], sA1));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD3], sA1));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[1]->stream(), s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD3]));
+        ggml_cuda_ar_add_kernel<float, nv_bfloat16><<<n_blocks, 256, 0, ctx[1]->stream()>>>(
+            data[1], reinterpret_cast<const nv_bfloat16 *>(tmpA1), (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        ggml_cuda_set_device(dev2);
+        CUDA_CHECK(cudaStreamWaitEvent(sB1, s->ev[ggml_cuda_ar3_sync::EV_D2H_T0T1]));
+        CUDA_CHECK(cudaMemcpyAsync(tmpB1, hostB0, nbytes, cudaMemcpyHostToDevice, sB1));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_READ_B0], sB1));
+        CUDA_CHECK(cudaEventRecord(s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD4], sB1));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[2]->stream(), s->ev[ggml_cuda_ar3_sync::EV_H2D_ADD4]));
+        ggml_cuda_ar_add_kernel<float, nv_bfloat16><<<n_blocks, 256, 0, ctx[2]->stream()>>>(
+            data[2], reinterpret_cast<const nv_bfloat16 *>(tmpB1), (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    s->read_valid[0] = true;
+    s->read_valid[1] = true;
+    s->read_valid[2] = true;
+    s->read_valid[3] = true;
+    s->read_valid[4] = true;
+    return true;
+}
+
+// Outer slicer: convert the full tensor to BF16 once (like the 2-device copy
+// path), then reduce it in buf_bytes-sized slices.  Each slice is an
+// independent element-wise sum with its own hazard fences (the read_valid
+// flags carry across slices).
+static bool ggml_cuda_ar3_copy(
+        ggml_cuda_ar_pipeline * pa,
+        ggml_cuda_ar_pipeline * pb,
+        ggml_cuda_ar3_sync    * s,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors,
+        int64_t                 ne,
+        const bool              compute[3]) {
+    // Convert F32 -> BF16 once (full tensor).  Inactive shards contribute
+    // zeros: zero the F32 accumulator (the add kernel accumulates into it) and
+    // convert, matching the 2-device BF16 path.
+    ggml_cuda_pool_alloc<nv_bfloat16> bf16_in[3];
+    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+    for (int i = 0; i < 3; ++i) {
+        const int dev = (i == 2) ? pb->devices[1] : pa->devices[i];
+        ggml_backend_cuda_context * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        ggml_cuda_set_device(dev);
+        bf16_in[i].pool = &ctx->pool();
+        bf16_in[i].alloc(ne);
+        if (!compute[i]) {
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, (size_t) ne * sizeof(float), ctx->stream()));
+        }
+        to_bf16(tensors[i]->data, bf16_in[i].get(), ne, ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int64_t max_elems = (int64_t) (s->buf_bytes / sizeof(nv_bfloat16));
+    GGML_ASSERT(max_elems > 0);
+
+    float * base[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        base[i] = reinterpret_cast<float *>(tensors[i]->data);
+    }
+
+    bool ok = true;
+    for (int64_t start = 0; start < ne && ok; start += max_elems) {
+        const int64_t slice_ne = std::min(max_elems, ne - start);
+        float * data[3] = {};
+        nv_bfloat16 * bfin[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            data[i] = base[i] + start;
+            bfin[i] = bf16_in[i].get() + start;
+        }
+        ok = ggml_cuda_ar3_copy_impl(pa, pb, s, backends, data, bfin, slice_ne, compute);
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -955,25 +1300,40 @@ bool ggml_cuda_ar_allreduce(
 bool ggml_cuda_ar_allreduce3(
         ggml_cuda_ar_pipeline * pipeline_a,
         ggml_cuda_ar_pipeline * pipeline_b,
+        ggml_cuda_ar3_sync    * ar3_sync,
         ggml_backend_t        * backends,
         ggml_tensor           ** tensors) {
-    // pipeline_a covers (dev0, dev1), pipeline_b covers (dev0, dev2).
-    // Step 1: reduce dev0 + dev1 on both devices.
+    const ggml_type input_type = tensors[0]->type;
+    const int64_t   ne         = ggml_nelements(tensors[0]);
+
+    // Large F32 tensors take the dedicated 3-device copy-engine path (BF16
+    // wire, F32 accumulate), which keeps the slow link off the critical path
+    // and halves the final-transfer bytes.  Small tensors and non-F32 inputs
+    // use the 2-pipeline path below.  The threshold is on the BF16 wire size,
+    // matching the 2-device copy-engine path.
+    const bool use_ar3_copy =
+        ar3_sync != nullptr &&
+        input_type == GGML_TYPE_F32 &&
+        pipeline_a->copy_threshold > 0 &&
+        (size_t) ne * sizeof(nv_bfloat16) >= pipeline_a->copy_threshold;
+
+    if (use_ar3_copy) {
+        bool compute[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            compute[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        }
+        return ggml_cuda_ar3_copy(pipeline_a, pipeline_b, ar3_sync, backends, tensors, ne, compute);
+    }
+
+    // 2-pipeline path: AR(dev0,dev1) -> AR(dev0,dev2) -> broadcast dev0->dev1.
     if (!ggml_cuda_ar_allreduce(pipeline_a, backends, tensors)) {
         return false;
     }
-    // Step 2: fold dev2 into dev0's partial sum (tensors[0] now holds t0+t1).
-    // The 2-device path indexes backends[0..1], so pass a pair matching
-    // pipeline_b's devices (dev0, dev2).
     ggml_tensor * pair_b[2] = { tensors[0], tensors[2] };
     ggml_backend_t backends_b[2] = { backends[0], backends[2] };
     if (!ggml_cuda_ar_allreduce(pipeline_b, backends_b, pair_b)) {
         return false;
     }
-    // Step 3: dev0 now holds t0+t1+t2; broadcast it to dev1.  The copy is
-    // enqueued on dev0's compute stream (ordered after both ARs) and dev1's
-    // compute stream waits on the copy event, so downstream ops on dev1 see
-    // the full sum.
     ggml_backend_tensor_copy_async(backends[0], backends[1], tensors[0], tensors[1]);
 
     return true;
@@ -994,7 +1354,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;
 }
-bool ggml_cuda_ar_allreduce3(ggml_cuda_ar_pipeline *, ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+bool ggml_cuda_ar_allreduce3(ggml_cuda_ar_pipeline *, ggml_cuda_ar_pipeline *, ggml_cuda_ar3_sync *, ggml_backend_t *, ggml_tensor **) {
     return false;
 }
 
