@@ -217,6 +217,183 @@ static __global__ void ggml_cuda_ar_add_kernel(
     }
 }
 
+// Three-way AllReduce: each device casts its shard to T_wire and stores it in
+// its own pinned slot, then every block waits for the two peers' arrival
+// tokens and sums all three wire values in fixed device-index order
+// ((w0 + w1) + w2).  Reading the self value back from host (instead of
+// sendbuf) makes all three operands the same T_wire-rounded values on every
+// GPU, so the non-associative float sum is bit-identical across devices.
+// One kernel launch per device replaces the 2-pipeline AR+AR+broadcast
+// sequence (stages A+B+C).
+template <typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_ar_kernel3(
+        const T_dst  *              sendbuf,
+        T_dst        *              recvbuf,
+        T_wire       * __restrict__ host_base,   // [rank] slots, rank_stride elems apart
+        int                         rank_stride, // elems between adjacent rank slots
+        int                         rank,
+        int                         count,
+        int *                       arrival_base, // [rank] per-block token blocks
+        int                         token) {
+
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+    constexpr int RANK_BLOCKS   = GGML_CUDA_AR_KERNEL_BLOCKS * ARRIVAL_INTS;
+
+    const T_wire * host_w0   = host_base;
+    const T_wire * host_w1   = host_base + rank_stride;
+    const T_wire * host_w2   = host_base + 2 * rank_stride;
+    T_wire       * host_self = host_base + (size_t)rank * rank_stride;
+
+    int       * my_slot    = arrival_base + rank * RANK_BLOCKS;
+    const int * peer0_slot = arrival_base + ((rank + 1) % 3) * RANK_BLOCKS;
+    const int * peer1_slot = arrival_base + ((rank + 2) % 3) * RANK_BLOCKS;
+
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+
+    // Phase 1: cast sendbuf (T_dst) -> own host slot (T_wire) as vectors.
+    {
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T_wire wire[ELEMS_PER_VEC];
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                wire[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+            }
+            ggml_cuda_memcpy_1<sizeof(wire)>(&host_self[off], wire);
+        }
+        if (bid == 0 && tid < count - tail) {
+            host_self[tail + tid] = ggml_cuda_cast<T_wire>(sendbuf[tail + tid]);
+        }
+    }
+
+    // Commit this block's host writes before signalling.
+    __threadfence_system();
+    __syncthreads();
+
+    // Phase 2: thread 0 signals its own arrival slot, then spins for both
+    // peers' matching slots.  Per-block tokens let blocks proceed independently.
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(my_slot + bid * ARRIVAL_INTS, token);
+        __threadfence_system(); // make our signal visible system-wide
+
+        while (ggml_cuda_ar_signal_get(peer0_slot + bid * ARRIVAL_INTS) != token ||
+               ggml_cuda_ar_signal_get(peer1_slot + bid * ARRIVAL_INTS) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        }
+    }
+
+    __syncthreads();
+
+    // Acquire the peers' host writes (this block's stripe of them).
+    __threadfence_system();
+
+    // Phase 3: read all three wire values, sum in fixed device-index order.
+    {
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T_wire w0[ELEMS_PER_VEC], w1[ELEMS_PER_VEC], w2[ELEMS_PER_VEC];
+            ggml_cuda_memcpy_1<sizeof(w0)>(w0, &host_w0[off]);
+            ggml_cuda_memcpy_1<sizeof(w1)>(w1, &host_w1[off]);
+            ggml_cuda_memcpy_1<sizeof(w2)>(w2, &host_w2[off]);
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                recvbuf[off + k] = ggml_cuda_cast<T_dst>(
+                    ggml_cuda_cast<float>(ggml_cuda_cast<float>(w0[k]) + ggml_cuda_cast<float>(w1[k])) +
+                    ggml_cuda_cast<float>(w2[k]));
+            }
+        }
+        if (bid == 0 && tid < count - tail) {
+            const float s = ggml_cuda_cast<float>(host_w0[tail + tid]) +
+                            ggml_cuda_cast<float>(host_w1[tail + tid]);
+            recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(s + ggml_cuda_cast<float>(host_w2[tail + tid]));
+        }
+    }
+}
+
+// Host-staged broadcast dev0 -> dev1 (stage C of the 2-pipeline 3-device AR).
+// The copy engine's fixed per-transfer latency (~80us) dominates small
+// tensors, and these GPUs have no P2P link, so the data is staged through
+// pinned host memory by SM kernels on both devices -- the same mechanism the
+// chunked AllReduce uses (its bidirectional stage A runs in ~30us).  Each
+// block stripes a disjoint slice and rendezvous on its own arrival token, so
+// multiple SMs pump PCIe traffic in parallel.
+static __global__ void ggml_cuda_ar_bcast_send_kernel(
+        const char * __restrict__ src,
+        char       * __restrict__ host,
+        size_t      nbytes,
+        int *       arrival,
+        int         token) {
+    constexpr int VEC = ggml_cuda_get_max_cpy_bytes(); // 16 B on Volta+
+    const int tid  = threadIdx.x;
+    const int nt   = blockDim.x;
+    const int bid  = blockIdx.x;
+    const int gtid = bid * nt + tid;
+    const int gnt  = gridDim.x * nt;
+    const int nvec = static_cast<int>(nbytes / VEC);
+    const int tail = nvec * VEC;
+
+    for (int i = gtid; i < nvec; i += gnt) {
+        ggml_cuda_memcpy_1<VEC>(host + (size_t) i * VEC, src + (size_t) i * VEC);
+    }
+    if (bid == 0 && tid < static_cast<int>(nbytes - tail)) {
+        host[tail + tid] = src[tail + tid];
+    }
+
+    // Commit this block's host writes before signalling.
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(arrival + bid * (GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int)), token);
+    }
+}
+
+static __global__ void ggml_cuda_ar_bcast_recv_kernel(
+        const char * __restrict__ host,
+        char       * __restrict__ dst,
+        size_t      nbytes,
+        const int * arrival,
+        int         token) {
+    constexpr int VEC = ggml_cuda_get_max_cpy_bytes(); // 16 B on Volta+
+    const int tid  = threadIdx.x;
+    const int nt   = blockDim.x;
+    const int bid  = blockIdx.x;
+    const int gtid = bid * nt + tid;
+    const int gnt  = gridDim.x * nt;
+    const int nvec = static_cast<int>(nbytes / VEC);
+    const int tail = nvec * VEC;
+
+    if (tid == 0) {
+        while (ggml_cuda_ar_signal_get(arrival + bid * (GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int))) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        }
+    }
+
+    __syncthreads();
+    __threadfence_system(); // acquire the sender's host writes
+
+    for (int i = gtid; i < nvec; i += gnt) {
+        ggml_cuda_memcpy_1<VEC>(dst + (size_t) i * VEC, host + (size_t) i * VEC);
+    }
+    if (bid == 0 && tid < static_cast<int>(nbytes - tail)) {
+        dst[tail + tid] = host[tail + tid];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline structure
 // ---------------------------------------------------------------------------
@@ -1297,6 +1474,403 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
+// diagnostic: per-stage timing of the 2-pipeline 3-device AR on dev0 stream.
+// stage A = AR(dev0,dev1), stage B = AR(dev0,dev2), stage C = broadcast dev0->dev1.
+// all events are recorded on dev0's compute stream (the critical path).
+struct ggml_cuda_ar3_stage_state {
+    static constexpr int R   = 64;
+    static constexpr int PER = 256;
+
+    struct slot { cudaEvent_t ev[6] = {}; }; // stage k: ev[2k]=start, ev[2k+1]=end
+    slot slots[R];
+    uint64_t calls = 0;
+
+    bool init(int dev0_device) {
+        // events are recorded on the dev0 stream, so they must be created under
+        // the dev0 CUDA context (cross-context record is invalid)
+        ggml_cuda_set_device(dev0_device);
+        for (int s = 0; s < R; ++s) {
+            for (int j = 0; j < 6; ++j) {
+                if (cudaEventCreate(&slots[s].ev[j]) != cudaSuccess) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void rec(int stage, int which, cudaStream_t stream) {
+        const int s = (int) (calls % R);
+        cudaEventRecord(slots[s].ev[stage * 2 + which], stream);
+    }
+
+    void finish(cudaStream_t stream) {
+        calls++;
+        if (calls % PER != 0) {
+            return;
+        }
+        double ms[3] = {};
+        for (int s = 0; s < R; ++s) {
+            for (int k = 0; k < 3; ++k) {
+                float t = 0.0f;
+                if (cudaEventElapsedTime(&t, slots[s].ev[2 * k], slots[s].ev[2 * k + 1]) == cudaSuccess) {
+                    ms[k] += t;
+                }
+            }
+        }
+        GGML_LOG_INFO("ar3_stage: %d ARs | dev0 stageA %.3f ms, stageB %.3f ms, stageC(bcast) %.3f ms | total %.3f ms\n",
+                      R, ms[0] / R, ms[1] / R, ms[2] / R, (ms[0] + ms[1] + ms[2]) / R);
+    }
+
+    void free() {
+        for (int s = 0; s < R; ++s) {
+            for (int j = 0; j < 6; ++j) {
+                if (slots[s].ev[j]) cudaEventDestroy(slots[s].ev[j]);
+            }
+        }
+    }
+};
+
+static ggml_cuda_ar3_stage_state * g_ar3_stage = nullptr;
+
+// Host-staged broadcast dev0 -> dev1 (stage C of the 2-pipeline 3-device AR).
+// The copy engine's fixed per-transfer latency (~80us) dominates small tensors
+// and these GPUs have no P2P link, so the data is staged through pinned host
+// memory by SM kernels on both devices -- the same mechanism as the chunked
+// AllReduce (whose bidirectional stage A runs in ~30us).  Double-buffered so
+// consecutive AR calls never share a staging slot; the monotonic token plus
+// the stage-A barrier lockstep keeps the arrival ring race-free.
+struct ggml_cuda_ar3_bcast_state {
+    bool                     ok = false;      // init succeeded
+    size_t                   buf_bytes = 0;   // per-slot host buffer size
+    uint64_t                 call_count = 0;  // monotonic token source
+    ggml_cuda_ar_host_mapping host[2];        // double-buffered pinned staging
+    ggml_cuda_ar_host_mapping arrival;        // per (slot, block) arrival ints
+};
+
+static ggml_cuda_ar3_bcast_state * g_ar3_bcast = nullptr;
+
+// Base arrival pointer for a slot; the kernel adds blockIdx.x * STRIDE/4.
+static int * ggml_cuda_ar3_bcast_arrival_ptr(const ggml_cuda_ar3_bcast_state * st, int slot) {
+    const size_t off = (size_t)slot * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(st->arrival.dev + off);
+}
+
+static bool ggml_cuda_ar3_bcast_init(int src_device, int dst_device) {
+    auto * st = new ggml_cuda_ar3_bcast_state();
+    st->buf_bytes = GGML_CUDA_AR_MAX_BYTES; // 1 MB per slot
+    for (int s = 0; s < 2; ++s) {
+        if (st->host[s].alloc(st->buf_bytes) != cudaSuccess) {
+            GGML_LOG_ERROR("ar3 bcast: host staging alloc failed (%zu bytes)\n", st->buf_bytes);
+            for (int j = 0; j < s; ++j) st->host[j].free();
+            delete st;
+            return false;
+        }
+    }
+    const size_t arrival_bytes = (size_t)2 * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    if (st->arrival.alloc(arrival_bytes) != cudaSuccess) {
+        GGML_LOG_ERROR("ar3 bcast: arrival ring alloc failed (%zu bytes)\n", arrival_bytes);
+        for (int j = 0; j < 2; ++j) st->host[j].free();
+        delete st;
+        return false;
+    }
+    ggml_cuda_set_device(src_device);
+    if (cudaMemset(st->arrival.dev, 0, arrival_bytes) != cudaSuccess) {
+        GGML_LOG_ERROR("ar3 bcast: arrival ring memset failed\n");
+        st->arrival.free();
+        for (int j = 0; j < 2; ++j) st->host[j].free();
+        delete st;
+        return false;
+    }
+    st->ok = true;
+    g_ar3_bcast = st;
+    GGML_LOG_INFO("ar3 bcast dev%d->dev%d: host-staged path active (slot=%zu bytes)\n",
+                  src_device, dst_device, st->buf_bytes);
+    return true;
+}
+
+// Enqueue the broadcast: send kernel on src's compute stream stages the data
+// to pinned host and signals; recv kernel on dst's compute stream spins for
+// the token then reads it into the local tensor.  Returns false (caller falls
+// back to the copy engine) when the tensor exceeds one staging slot or a
+// launch fails.  The caller already holds the src device context.
+static bool ggml_cuda_ar3_bcast_run(
+        ggml_backend_cuda_context * src_ctx,
+        ggml_backend_cuda_context * dst_ctx,
+        const void *                src_data,
+        void *                      dst_data,
+        size_t                      nbytes) {
+    if (g_ar3_bcast == nullptr || !g_ar3_bcast->ok || nbytes > g_ar3_bcast->buf_bytes) {
+        return false;
+    }
+    const int slot  = (int)(g_ar3_bcast->call_count % 2);
+    const int token = (int)(g_ar3_bcast->call_count + 1);
+    g_ar3_bcast->call_count++;
+
+    ggml_cuda_set_device(src_ctx->device);
+    ggml_cuda_ar_bcast_send_kernel<<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, src_ctx->stream()>>>(
+        static_cast<const char *>(src_data),
+        reinterpret_cast<char *>(g_ar3_bcast->host[slot].dev),
+        nbytes,
+        ggml_cuda_ar3_bcast_arrival_ptr(g_ar3_bcast, slot),
+        token);
+    if (cudaGetLastError() != cudaSuccess) {
+        return false; // do not launch the receiver (it would spin forever)
+    }
+
+    ggml_cuda_set_device(dst_ctx->device);
+    ggml_cuda_ar_bcast_recv_kernel<<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, dst_ctx->stream()>>>(
+        reinterpret_cast<const char *>(g_ar3_bcast->host[slot].dev),
+        static_cast<char *>(dst_data),
+        nbytes,
+        ggml_cuda_ar3_bcast_arrival_ptr(g_ar3_bcast, slot),
+        token);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+// Three-way AllReduce state: one pinned allocation holding [slot][rank] host
+// staging slots plus a matching arrival ring, and per-(device,slot) kernel-done
+// events for the pool-wraparound cross-device barrier.  Replaces the 2-pipeline
+// AR+AR+broadcast sequence (stages A+B+C) with one kernel launch per device.
+struct ggml_cuda_ar3way_state {
+    bool                     ok = false;
+    size_t                   rank_bytes = 0;     // bytes per rank slot (wire size)
+    size_t                   bf16_threshold = 1; // F32 tensors >= this use BF16 wire
+    uint64_t                 call_count = 0;     // monotonic token source
+    ggml_cuda_ar_host_mapping host;              // [slot][rank] staging
+    ggml_cuda_ar_host_mapping arrival;           // [slot][rank] per-block tokens
+    cudaEvent_t              ker_done[3][GGML_CUDA_AR_POOL_SIZE];
+};
+
+static ggml_cuda_ar3way_state * g_ar3way = nullptr;
+
+// Base of the (slot) rank-staging block, in bytes.  The kernel adds its own
+// rank offset internally; all three devices share this base for a given slot.
+static char * ggml_cuda_ar3way_slot_ptr(const ggml_cuda_ar3way_state * st, int slot) {
+    return reinterpret_cast<char *>(st->host.dev) + (size_t)slot * 3 * st->rank_bytes;
+}
+
+// Base of the (slot) arrival ring.  The kernel adds rank * RANK_BLOCKS and
+// bid * ARRIVAL_INTS internally to land on its own per-block token slot.
+static int * ggml_cuda_ar3way_arrival_ptr(const ggml_cuda_ar3way_state * st, int slot) {
+    const size_t off = (size_t)slot * 3 * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(st->arrival.dev + off);
+}
+
+static bool ggml_cuda_ar3way_init(int * devices) {
+    auto * st = new ggml_cuda_ar3way_state();
+    st->rank_bytes     = GGML_CUDA_AR_MAX_BYTES; // 1 MB per rank slot
+    st->bf16_threshold = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+
+    const size_t host_total = (size_t)GGML_CUDA_AR_POOL_SIZE * 3 * st->rank_bytes;
+    if (st->host.alloc(host_total) != cudaSuccess) {
+        GGML_LOG_ERROR("ar3way: host staging alloc failed (%zu bytes)\n", host_total);
+        delete st;
+        return false;
+    }
+    const size_t arrival_bytes =
+        (size_t)GGML_CUDA_AR_POOL_SIZE * 3 * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    if (st->arrival.alloc(arrival_bytes) != cudaSuccess) {
+        GGML_LOG_ERROR("ar3way: arrival ring alloc failed (%zu bytes)\n", arrival_bytes);
+        st->host.free();
+        delete st;
+        return false;
+    }
+    // Kernel-done events are created under each device's own context so the
+    // later cudaEventRecord on that device's stream is same-context.
+    for (int i = 0; i < 3; ++i) {
+        ggml_cuda_set_device(devices[i]);
+        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+            if (cudaEventCreateWithFlags(&st->ker_done[i][s], cudaEventDisableTiming) != cudaSuccess) {
+                GGML_LOG_ERROR("ar3way: ker_done event create failed\n");
+                st->arrival.free();
+                st->host.free();
+                delete st;
+                return false;
+            }
+        }
+    }
+    ggml_cuda_set_device(devices[0]);
+    if (cudaMemset(st->arrival.dev, 0, arrival_bytes) != cudaSuccess) {
+        GGML_LOG_ERROR("ar3way: arrival ring memset failed\n");
+        st->arrival.free();
+        st->host.free();
+        delete st;
+        return false;
+    }
+    st->ok = true;
+    g_ar3way = st;
+    GGML_LOG_INFO("ar3way: 3-way kernel path active (rank slot=%zu bytes)\n", st->rank_bytes);
+    return true;
+}
+
+static void ggml_cuda_ar3way_free() {
+    if (g_ar3way == nullptr) {
+        return;
+    }
+    for (int i = 0; i < 3; ++i) {
+        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+            cudaEventDestroy(g_ar3way->ker_done[i][s]);
+        }
+    }
+    g_ar3way->arrival.free();
+    g_ar3way->host.free();
+    delete g_ar3way;
+    g_ar3way = nullptr;
+}
+
+// Three-way AllReduce dispatch: one kernel3 launch per device replaces the
+// 2-pipeline AR+AR+broadcast sequence (stages A+B+C).  All three devices stage
+// their shard to pinned host, rendezvous on arrival tokens in-kernel, and sum in
+// fixed device-index order.  Single-shot: the tensor must fit one rank slot;
+// larger tensors return false so the caller falls back to the 2-pipeline path.
+bool ggml_cuda_ar_allreduce3way(
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    GGML_ASSERT(g_ar3way != nullptr && g_ar3way->ok);
+
+    const int n = 3;
+    int devices[3];
+    for (int i = 0; i < n; ++i) {
+        devices[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device;
+    }
+    const ggml_type input_type = tensors[0]->type;
+    GGML_ASSERT(input_type == GGML_TYPE_F32 || input_type == GGML_TYPE_F16 || input_type == GGML_TYPE_BF16);
+    const int64_t ne = ggml_nelements(tensors[0]);
+    GGML_ASSERT(ne > 0);
+
+    // BF16 round-trip for F32 inputs (matches the 2-device path).
+    const size_t input_nbytes = ggml_nbytes(tensors[0]);
+    const bool use_bf16 =
+        input_type == GGML_TYPE_F32 &&
+        g_ar3way->bf16_threshold > 0 &&
+        input_nbytes >= g_ar3way->bf16_threshold;
+    const ggml_type kernel_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
+    const size_t type_size = ggml_type_size(kernel_type);
+
+    // Single-shot guard: whole tensor must fit one rank slot.  Decode tensors are
+    // small (80 KiB); anything larger falls back to the 2-pipeline path.
+    if ((size_t)ne * type_size > g_ar3way->rank_bytes) {
+        return false;
+    }
+
+    bool compute_flag[3] = {};
+    for (int i = 0; i < n; ++i) {
+        compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    }
+
+    // Inactive shards contribute zeros (NCCL/meta semantics).  With use_bf16 the
+    // kernel accumulates into the F32 tensor data, so zero the accumulator first.
+    if (use_bf16) {
+        for (int i = 0; i < n; ++i) {
+            if (!compute_flag[i]) {
+                auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                ggml_cuda_set_device(devices[i]);
+                CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, (size_t)ne * sizeof(float), cuda_ctx->stream()));
+            }
+        }
+    }
+
+    const int slot = (int)(g_ar3way->call_count % GGML_CUDA_AR_POOL_SIZE);
+    const bool pool_lapped = g_ar3way->call_count >= GGML_CUDA_AR_POOL_SIZE;
+    g_ar3way->call_count++;
+    const int token = (int)g_ar3way->call_count;
+
+    // Cross-device barrier: wait for the AR N-2 kernels on all devices to have
+    // finished reading this slot before we overwrite it.  Same role as acquire_slot's
+    // cudaEventSynchronize in the 2-device path.
+    if (pool_lapped) {
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(devices[i]);
+            CUDA_CHECK(cudaEventSynchronize(g_ar3way->ker_done[i][slot]));
+        }
+    }
+
+    char * host_base = ggml_cuda_ar3way_slot_ptr(g_ar3way, slot);
+    int  * arrival   = ggml_cuda_ar3way_arrival_ptr(g_ar3way, slot);
+    const int rank_stride = (int)(g_ar3way->rank_bytes / type_size);
+
+#define LAUNCH_AR3_KERNEL(T_dst, T_wire) \
+    for (int i = 0; i < n; ++i) { \
+        ggml_cuda_set_device(devices[i]); \
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context); \
+        GGML_ASSERT(cuda_ctx->device == devices[i]); \
+        cudaStream_t stream = cuda_ctx->stream(); \
+        ggml_cuda_ar_kernel3<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+            static_cast<const T_dst *>(tensors[i]->data), \
+            static_cast<T_dst *>(tensors[i]->data), \
+            reinterpret_cast<T_wire *>(host_base), \
+            rank_stride, i, (int)ne, arrival, token); \
+        CUDA_CHECK(cudaGetLastError()); \
+        CUDA_CHECK(cudaEventRecord(g_ar3way->ker_done[i][slot], stream)); \
+    }
+
+    if (use_bf16) {
+        GGML_ASSERT(kernel_type == GGML_TYPE_BF16);
+        LAUNCH_AR3_KERNEL(float, nv_bfloat16);
+    } else {
+        switch (kernel_type) {
+            case GGML_TYPE_F32:  LAUNCH_AR3_KERNEL(float, float); break;
+            case GGML_TYPE_F16:  LAUNCH_AR3_KERNEL(half, half); break;
+            case GGML_TYPE_BF16: LAUNCH_AR3_KERNEL(nv_bfloat16, nv_bfloat16); break;
+            default: GGML_ASSERT(false);
+        }
+    }
+
+#undef LAUNCH_AR3_KERNEL
+    return true;
+}
+
+// dev0-stream timing for the 3-way kernel path: one event pair per call,
+// printed every PER calls.  Complements ar_timing (which brackets the whole
+// allreduce3 on each device) by isolating the single 3-way kernel launch.
+struct ggml_cuda_ar3way_timing {
+    static constexpr int R   = 64;
+    static constexpr int PER = 256;
+    struct slot { cudaEvent_t ev[2] = {}; };
+    slot slots[R];
+    uint64_t calls = 0;
+
+    bool init(int dev0_device) {
+        ggml_cuda_set_device(dev0_device);
+        for (int s = 0; s < R; ++s) {
+            if (cudaEventCreate(&slots[s].ev[0]) != cudaSuccess ||
+                cudaEventCreate(&slots[s].ev[1]) != cudaSuccess) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void rec(int which, cudaStream_t stream) {
+        cudaEventRecord(slots[(int)(calls % R)].ev[which], stream);
+    }
+
+    void finish(cudaStream_t stream) {
+        calls++;
+        if (calls % PER != 0) {
+            return;
+        }
+        double ms = 0.0;
+        for (int s = 0; s < R; ++s) {
+            float t = 0.0f;
+            if (cudaEventElapsedTime(&t, slots[s].ev[0], slots[s].ev[1]) == cudaSuccess) {
+                ms += t;
+            }
+        }
+        GGML_LOG_INFO("ar3way: %d ARs | 3-way kernel %.3f ms\n", R, ms / R);
+    }
+
+    void free() {
+        for (int s = 0; s < R; ++s) {
+            cudaEventDestroy(slots[s].ev[0]);
+            cudaEventDestroy(slots[s].ev[1]);
+        }
+    }
+};
+
+static ggml_cuda_ar3way_timing * g_ar3way_timing = nullptr;
+
 bool ggml_cuda_ar_allreduce3(
         ggml_cuda_ar_pipeline * pipeline_a,
         ggml_cuda_ar_pipeline * pipeline_b,
@@ -1325,16 +1899,85 @@ bool ggml_cuda_ar_allreduce3(
         return ggml_cuda_ar3_copy(pipeline_a, pipeline_b, ar3_sync, backends, tensors, ne, compute);
     }
 
+    // 3-way kernel path (on by default; set GGML_CUDA_AR3WAY=0 to disable): one
+    // kernel launch per device replaces the 2-pipeline AR+AR+broadcast sequence.
+    // Falls back to the 2-pipeline path when the tensor exceeds one rank slot or
+    // init failed.
+    auto * dev0_ctx = static_cast<ggml_backend_cuda_context *>(backends[0]->context);
+    const char * ar3way_env = getenv("GGML_CUDA_AR3WAY");
+    if (ar3way_env == nullptr || strcmp(ar3way_env, "0") != 0) {
+        if (g_ar3way == nullptr) {
+            ggml_cuda_set_device(dev0_ctx->device);
+            int devs[3] = {
+                dev0_ctx->device,
+                static_cast<ggml_backend_cuda_context *>(backends[1]->context)->device,
+                static_cast<ggml_backend_cuda_context *>(backends[2]->context)->device};
+            ggml_cuda_ar3way_init(devs);
+        }
+        if (g_ar3way != nullptr && g_ar3way->ok) {
+            if (g_ar3way_timing == nullptr && getenv("GGML_CUDA_AR_TIMING") != nullptr) {
+                g_ar3way_timing = new ggml_cuda_ar3way_timing();
+                if (!g_ar3way_timing->init(dev0_ctx->device)) {
+                    delete g_ar3way_timing;
+                    g_ar3way_timing = nullptr;
+                }
+            }
+            if (g_ar3way_timing != nullptr) {
+                g_ar3way_timing->rec(0, dev0_ctx->stream());
+            }
+            const bool ok3 = ggml_cuda_ar_allreduce3way(backends, tensors);
+            if (g_ar3way_timing != nullptr) {
+                g_ar3way_timing->rec(1, dev0_ctx->stream());
+                g_ar3way_timing->finish(dev0_ctx->stream());
+            }
+            if (ok3) {
+                return true;
+            }
+            // tensor too large for one rank slot: fall through to 2-pipeline path
+        }
+    }
     // 2-pipeline path: AR(dev0,dev1) -> AR(dev0,dev2) -> broadcast dev0->dev1.
+    if (g_ar3_bcast == nullptr) {
+        const int dev1_device = static_cast<ggml_backend_cuda_context *>(backends[1]->context)->device;
+        ggml_cuda_set_device(dev0_ctx->device);
+        ggml_cuda_ar3_bcast_init(dev0_ctx->device, dev1_device);
+    }
+    if (g_ar3_stage == nullptr && getenv("GGML_CUDA_AR_TIMING") != nullptr) {
+        g_ar3_stage = new ggml_cuda_ar3_stage_state();
+        if (!g_ar3_stage->init(dev0_ctx->device)) {
+            delete g_ar3_stage;
+            g_ar3_stage = nullptr;
+        }
+    }
+    auto rec0 = [&](int stage, int which) {
+        if (g_ar3_stage != nullptr) {
+            ggml_cuda_set_device(dev0_ctx->device);
+            g_ar3_stage->rec(stage, which, dev0_ctx->stream());
+        }
+    };
+    rec0(0, 0);
     if (!ggml_cuda_ar_allreduce(pipeline_a, backends, tensors)) {
         return false;
     }
+    rec0(0, 1);
     ggml_tensor * pair_b[2] = { tensors[0], tensors[2] };
     ggml_backend_t backends_b[2] = { backends[0], backends[2] };
+    rec0(1, 0);
     if (!ggml_cuda_ar_allreduce(pipeline_b, backends_b, pair_b)) {
         return false;
     }
-    ggml_backend_tensor_copy_async(backends[0], backends[1], tensors[0], tensors[1]);
+    rec0(1, 1);
+    rec0(2, 0);
+    auto * dev1_ctx = static_cast<ggml_backend_cuda_context *>(backends[1]->context);
+    if (!ggml_cuda_ar3_bcast_run(dev0_ctx, dev1_ctx, tensors[0]->data, tensors[1]->data, ggml_nbytes(tensors[0]))) {
+        // P2P unavailable: copy-engine peer copy (previous behaviour).
+        ggml_backend_tensor_copy_async(backends[0], backends[1], tensors[0], tensors[1]);
+    }
+    rec0(2, 1);
+    if (g_ar3_stage != nullptr) {
+        ggml_cuda_set_device(dev0_ctx->device);
+        g_ar3_stage->finish(dev0_ctx->stream());
+    }
 
     return true;
 }

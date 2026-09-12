@@ -959,6 +959,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     return &ggml_backend_cuda_buffer_types[device];
 }
 
+// Forward declaration; defined in the timing instrumentation block below.
+struct ggml_cuda_ar_timing_state;
+
 // Communication context for multi-GPU AllReduce during tensor parallelism.
 //
 // Created once per meta backend instance.  Resources for the selected mode
@@ -983,6 +986,9 @@ struct ggml_backend_cuda_comm_context {
     ggml_cuda_ar_pipeline *     ar_pipeline_b = nullptr;
     // 3-device large-tensor copy-engine sync state (dedicated staging/events).
     ggml_cuda_ar3_sync *        ar3_sync = nullptr;
+
+    // Diagnostic AR timing, one ring per model (target vs draft).
+    ggml_cuda_ar_timing_state * ar_timing = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -1077,6 +1083,210 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 }
 #endif // GGML_USE_NCCL
 
+// ---------------------------------------------------------------------------
+// AllReduce timing instrumentation (diagnostic)
+//
+// CUDA events bracket each internal AllReduce on every device's compute
+// stream.  The AR work (chunked kernel, or the copy-engine add kernels that
+// run on the compute stream after waiting on the H2D handoff) is ordered
+// between the two records, so the span includes the barrier wait itself.
+// One ring is kept per model (per comm context), so target and draft ARs do
+// not interleave in the same ring.  Every PER calls the full ring is queried:
+// ar_ms is the mean time inside the AR, gap_ms the mean time between
+// consecutive ARs (i.e. one layer's compute on that device).  Enable with
+// GGML_CUDA_AR_TIMING=1.
+// ---------------------------------------------------------------------------
+struct ggml_cuda_ar_timing_state {
+    static constexpr int R   = 64;  // ring depth
+    static constexpr int PER = 256; // print period (ARs)
+
+    struct slot { cudaEvent_t start[3] = {}; cudaEvent_t end[3] = {}; };
+    slot slots[R];
+    uint64_t calls        = 0;
+    uint64_t bytes_window = 0; // bytes since last print
+    int      model_id     = 0; // 0 = first model seen (target), 1 = draft
+
+    bool init(ggml_backend_t * backends, size_t n) {
+        static int next_model_id = 0;
+        model_id = next_model_id++;
+        // events must be created under the context of the device they are
+        // recorded on (cross-device record is invalid)
+        for (int s = 0; s < R; ++s) {
+            for (size_t i = 0; i < n; ++i) {
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                ggml_cuda_set_device(ctx->device);
+                if (cudaEventCreate(&slots[s].start[i]) != cudaSuccess ||
+                    cudaEventCreate(&slots[s].end[i])   != cudaSuccess) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void begin(ggml_backend_t * backends, size_t n) {
+        const int s = (int) (calls % R);
+        for (size_t i = 0; i < n; ++i) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            ggml_cuda_set_device(ctx->device);
+            cudaEventRecord(slots[s].start[i], ctx->stream());
+        }
+    }
+
+    void end(ggml_backend_t * backends, size_t n, uint64_t tensor_bytes) {
+        const int s = (int) (calls % R);
+        for (size_t i = 0; i < n; ++i) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            ggml_cuda_set_device(ctx->device);
+            cudaEventRecord(slots[s].end[i], ctx->stream());
+        }
+        calls++;
+        bytes_window += tensor_bytes;
+        if (calls % PER != 0) {
+            return;
+        }
+        // ring just filled PER times: query the most recent R slots.  The
+        // newest slot may not be complete yet; cudaEventElapsedTime blocks
+        // until it is, adding at most one AR of GPU time once per PER calls.
+        double ar_ms[3] = {};
+        double gap_ms[3] = {};
+        for (int s0 = 0; s0 < R; ++s0) {
+            const int s1 = (s0 + 1) % R;
+            for (size_t i = 0; i < n; ++i) {
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                ggml_cuda_set_device(ctx->device);
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, slots[s0].start[i], slots[s0].end[i]) == cudaSuccess) {
+                    ar_ms[i] += ms;
+                }
+                if (cudaEventElapsedTime(&ms, slots[s0].end[i], slots[s1].start[i]) == cudaSuccess) {
+                    gap_ms[i] += ms;
+                }
+            }
+        }
+        char line[256];
+        int off = snprintf(line, sizeof(line), "ar_timing: m%d %d ARs | tensor %.1f KiB/AR |",
+                           model_id, R, bytes_window / (double) PER / 1024.0);
+        bytes_window = 0;
+        for (size_t i = 0; i < n && off > 0 && (size_t) off < sizeof(line); ++i) {
+            off += snprintf(line + off, sizeof(line) - (size_t) off, " | dev%zu ar %.3f ms, gap %.3f ms",
+                            i, ar_ms[i] / R, gap_ms[i] / R);
+        }
+        GGML_LOG_INFO("%s\n", line);
+    }
+
+    void free() {
+        for (int s = 0; s < R; ++s) {
+            for (size_t i = 0; i < 3; ++i) {
+                if (slots[s].start[i]) cudaEventDestroy(slots[s].start[i]);
+                if (slots[s].end[i])   cudaEventDestroy(slots[s].end[i]);
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Subgraph timing: bracket every CUDA graph_compute call (one per meta
+// subgraph, ~81 per decode step) with events to attribute the time between
+// AR barriers: sg is the GPU compute of one subgraph slice, gap is the span
+// until the next event pair begins.  One ring per backend so target and
+// draft do not interleave.  Enable with GGML_CUDA_AR_TIMING=1.
+// ---------------------------------------------------------------------------
+struct ggml_cuda_subgraph_timing_state {
+    static constexpr int R   = 81;  // one slot per meta subgraph
+    static constexpr int PER = 810; // print period (subgraphs, ~10 steps)
+
+    cudaEvent_t ev_start[R] = {};
+    cudaEvent_t ev_end[R]   = {};
+    uint64_t calls   = 0;
+    int      model_id = 0; // 0 = first backend seen (target dev0), ...
+
+    bool init(ggml_backend_t backend) {
+        static int next_model_id = 0;
+        model_id = next_model_id++;
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+        ggml_cuda_set_device(ctx->device);
+        for (int s = 0; s < R; ++s) {
+            if (cudaEventCreate(&ev_start[s]) != cudaSuccess ||
+                cudaEventCreate(&ev_end[s])   != cudaSuccess) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void begin(ggml_backend_t backend) {
+        const int s = (int) (calls % R);
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+        ggml_cuda_set_device(ctx->device);
+        cudaEventRecord(ev_start[s], ctx->stream());
+    }
+
+    void end(ggml_backend_t backend) {
+        const int s = (int) (calls % R);
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+        ggml_cuda_set_device(ctx->device);
+        cudaEventRecord(ev_end[s], ctx->stream());
+        calls++;
+        if (calls % PER != 0) {
+            return;
+        }
+        double sg_ms[R] = {};
+        for (int s0 = 0; s0 < R; ++s0) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, ev_start[s0], ev_end[s0]) == cudaSuccess) {
+                sg_ms[s0] = ms;
+            }
+        }
+        double total = 0.0, maxv = 0.0;
+        int maxj = 0;
+        for (int s0 = 0; s0 < R; ++s0) {
+            total += sg_ms[s0];
+            if (sg_ms[s0] > maxv) {
+                maxv = sg_ms[s0];
+                maxj = s0;
+            }
+        }
+        GGML_LOG_INFO("sg_timing: m%d %d subgraphs | total %.1f ms, max sg[%d] %.3f ms\n",
+                      model_id, R, total, maxj, maxv);
+        char line[768];
+        int off = snprintf(line, sizeof(line), "sg_timing: slots (ms)");
+        for (int s0 = 0; s0 < R && off > 0 && (size_t) off + 8 < sizeof(line); ++s0) {
+            off += snprintf(line + off, sizeof(line) - (size_t) off, " %.1f", sg_ms[s0]);
+        }
+        GGML_LOG_INFO("%s\n", line);
+    }
+
+    void free() {
+        for (int s = 0; s < R; ++s) {
+            if (ev_start[s]) cudaEventDestroy(ev_start[s]);
+            if (ev_end[s])   cudaEventDestroy(ev_end[s]);
+        }
+    }
+};
+
+static std::mutex ggml_cuda_sg_timing_lock;
+static std::map<ggml_backend_t, ggml_cuda_subgraph_timing_state *> ggml_cuda_sg_timing_map;
+
+static ggml_cuda_subgraph_timing_state * ggml_cuda_sg_timing_get(ggml_backend_t backend) {
+    if (getenv("GGML_CUDA_AR_TIMING") == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_sg_timing_lock);
+    auto it = ggml_cuda_sg_timing_map.find(backend);
+    if (it != ggml_cuda_sg_timing_map.end()) {
+        return it->second;
+    }
+    auto * t = new ggml_cuda_subgraph_timing_state();
+    if (!t->init(backend)) {
+        delete t;
+        GGML_LOG_WARN("%s: subgraph timing enabled but event init failed\n", __func__);
+        return nullptr;
+    }
+    ggml_cuda_sg_timing_map[backend] = t;
+    return t;
+}
+
 // Run the internal AR pipeline.  Returns false on unsupported / failed input
 // -- the caller decides whether to abort (env-forced) or fall back silently.
 static bool ggml_backend_cuda_comm_allreduce_internal(
@@ -1123,13 +1333,33 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
         GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
     }
 
-    if (n_backends == 3) {
-        return ggml_cuda_ar_allreduce3(
-            comm_ctx->ar_pipeline, comm_ctx->ar_pipeline_b, comm_ctx->ar3_sync,
-            comm_ctx->backends.data(), tensors);
+    // diagnostic: bracket this AR with CUDA events when GGML_CUDA_AR_TIMING is set
+    if (comm_ctx->ar_timing == nullptr && getenv("GGML_CUDA_AR_TIMING") != nullptr) {
+        auto * t = new ggml_cuda_ar_timing_state();
+        if (t->init(comm_ctx->backends.data(), n_backends)) {
+            comm_ctx->ar_timing = t;
+        } else {
+            delete t;
+            GGML_LOG_WARN("%s: AR timing enabled but event init failed\n", __func__);
+        }
+    }
+    if (comm_ctx->ar_timing != nullptr) {
+        comm_ctx->ar_timing->begin(comm_ctx->backends.data(), n_backends);
     }
 
-    return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
+    bool ok;
+    if (n_backends == 3) {
+        ok = ggml_cuda_ar_allreduce3(
+            comm_ctx->ar_pipeline, comm_ctx->ar_pipeline_b, comm_ctx->ar3_sync,
+            comm_ctx->backends.data(), tensors);
+    } else {
+        ok = ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
+    }
+
+    if (comm_ctx->ar_timing != nullptr) {
+        comm_ctx->ar_timing->end(comm_ctx->backends.data(), n_backends, ggml_nbytes(tensors[0]));
+    }
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,10 +1386,15 @@ static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
 }
 
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
-    if (comm_ctx_v == nullptr) {
+    auto * ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (ctx == nullptr) {
         return;
     }
-    delete static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (ctx->ar_timing != nullptr) {
+        ctx->ar_timing->free();
+        delete ctx->ar_timing;
+    }
+    delete ctx;
 }
 
 // ---------------------------------------------------------------------------
@@ -4497,7 +4732,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    // diagnostic: bracket this subgraph replay with CUDA events when
+    // GGML_CUDA_AR_TIMING is set (see ggml_cuda_subgraph_timing_state)
+    // skip during graph capture: events recorded there are captured into the
+    // graph instead of timed on the GPU, and break later event queries
+    ggml_cuda_subgraph_timing_state * sg_timing = ggml_cuda_sg_timing_get(backend);
+    const bool sg_timing_ok = sg_timing != nullptr && !(use_cuda_graph && cuda_graph_update_required);
+    if (sg_timing_ok) {
+        sg_timing->begin(backend);
+    }
+
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (sg_timing_ok) {
+        sg_timing->end(backend);
+    }
 
     return GGML_STATUS_SUCCESS;
 }

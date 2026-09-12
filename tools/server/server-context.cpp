@@ -2769,11 +2769,15 @@ private:
     int64_t t_decode      = 0;
     int64_t t_post_decode = 0;
     int64_t t_sampl       = 0;
+    int64_t t_tgt_fwd     = 0; // target model forward (llama_decode)
+    int64_t t_mtp_draft   = 0; // speculative draft generation
     int64_t n_pre_decode  = 0;
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
+    int64_t n_tgt_fwd     = 0;
+    int64_t n_mtp_draft   = 0;
+#define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
         int64_t & t;
@@ -2797,12 +2801,15 @@ private:
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
+        static bool timing_on = getenv("LLAMA_SERVER_TIMING") != nullptr;
         int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+        if (timing_on && t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
             t_prev = t_start;
             SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
             SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
             SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
+            SRV_INF("avg t_tgt_fwd     = %f ms\n", (double) t_tgt_fwd / n_tgt_fwd / 1000.0);
+            SRV_INF("avg t_mtp_draft   = %f ms\n", (double) t_mtp_draft / n_mtp_draft / 1000.0);
             SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
@@ -3682,12 +3689,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
-            }
-        });
+        {
+            scoped_timer t(t_tgt_fwd, n_tgt_fwd);
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_decode(ctx_tgt, batch_view);
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        }
 
         if (ret != 0) {
             {
@@ -3747,6 +3757,7 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            scoped_timer t(t_mtp_draft, n_mtp_draft);
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
@@ -3912,6 +3923,7 @@ private:
 
             // verify and try to accept the draft
             {
+                scoped_timer timer(t_sampl, n_sampl);
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);

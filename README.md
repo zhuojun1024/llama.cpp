@@ -23,7 +23,7 @@ This fork targets 3-GPU inference on a mixed PCIe topology without P2P (two RTX 
 
 | Branch | AllReduce approach |
 |--------|--------------------|
-| `ar3-opt` (recommended) | 3-device AllReduce: two 2-device pipelines for small tensors, plus a dedicated copy-engine path for large F32 tensors (BF16 wire, F32 accumulate, keeps the slow PCIe link off the critical path) |
+| `ar3-opt` (recommended) | 3-device AllReduce: single 3-way kernel for small tensors (all three GPUs stage to pinned host and sum in fixed device order), plus a dedicated copy-engine path for large F32 tensors (BF16 wire, F32 accumulate, keeps the slow PCIe link off the critical path) |
 | `ar3-dual` | 3-device AllReduce composed of two 2-device pipelines: AR(dev0,dev1) -> AR(dev0,dev2) -> broadcast dev0 to dev1 |
 | `ar3-ring` | 3-device ring AllReduce for large tensors (BF16 wire, subchunked D2H/H2D), disabled by default |
 | `all` | integration branch: upstream master + common fixes, no 3-device AllReduce |
@@ -36,6 +36,24 @@ Common to all branches:
 - mtmd: tensor split for CLIP mmproj across multiple GPUs
 - `-sm tensor` split mode support
 - docs: local Windows build notes
+
+### ar3-opt: 3-way AllReduce kernel and tensor split
+
+The small-tensor path (decode) uses one 3-way kernel per device instead of the two-pipeline AR+AR+broadcast sequence. Each GPU casts its shard to a pinned host slot, spins on arrival tokens from the two peers, and sums all three values in fixed device-index order so the result is bit-identical on every GPU. The path is on by default; set `GGML_CUDA_AR3WAY=0` to fall back to the two-pipeline sequence. Large tensors (prefill) keep the copy-engine path unchanged.
+
+The 3-way kernel only pays off when per-device compute is balanced: it spin-waits for the slowest peer, so an unbalanced split makes it slower than the two-pipeline path. Balance the `-ts` split so all three devices finish a step at roughly the same time. Measured on this topology (two RTX 5060 Ti + one Tesla T10, Qwen3.8-27B, draft-mtp):
+
+| Config | Decode | Prefill |
+|--------|--------|---------|
+| two-pipeline AR, `-ts 0.96,1.02,1` | ~37 tok/s | ~575 tok/s |
+| 3-way kernel, `-ts 1,1,0.64` | ~44.5 tok/s | ~665 tok/s |
+
+The T10 is slower per unit of weight than the RTX cards, so it takes less weight (`0.64` vs `1`). The exact optimum depends on the model and card mix; measure with `GGML_CUDA_AR_TIMING=1` and adjust.
+
+Diagnostics (off by default):
+
+- `GGML_CUDA_AR_TIMING=1`: per-AR timing (`ar_timing`), per-subgraph compute (`sg_timing`), 3-way kernel time (`ar3way`)
+- `LLAMA_SERVER_TIMING=1`: periodic server timing lines
 
 ## Quick start
 
